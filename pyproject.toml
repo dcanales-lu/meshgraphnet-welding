@@ -1,0 +1,74 @@
+[project]
+name = "meshgraphnet_welding"
+version = "0.1.0"
+description = "MeshGraphNet surrogate for 2D transient welding thermal simulation"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Diego Canales", email = "diegocanales@gmail.com" }]
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "meshio",
+    "scikit-fem",
+    "torch",
+    "torchvision",
+    "torch-geometric",
+    "tqdm",
+    "h5py>=3.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "ipykernel",
+    "jupyter",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# src layout: subpackages live directly under src/ per requested structure
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/simulation",
+    "src/data",
+    "src/models",
+    "src/training",
+]
+
+# ---------------------------------------------------------------------------
+# Platform-conditional PyTorch wheels:
+#   * Windows (local dev, no GPU) -> CPU wheels
+#   * Linux   (RunPod deployment) -> CUDA 12.4 wheels
+# `uv sync` automatically selects the right index per platform.
+# ---------------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

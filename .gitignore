@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+# (uv.lock IS committed; only ignore caches)
+.uv/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project data artifacts (generated FEM datasets, graphs, checkpoints, logs)
+data/raw/
+data/processed/
+*.npz
+*.npy
+*.vtk
+*.vtu
+*.xdmf
+*.h5
+checkpoints/
+checkpoints_*/
+runs/
+wandb/
+*.pt
+*.pth
+
+# Generated output artifacts (rollout exports, videos, CSV/PNG analyses) — large
+# and regenerable; not needed on the training pod.
+data/output/
+*.mp4
+
+# Exception: commit the training dataset (.npz only) so RunPod can `git clone`
+# code + data in one shot. Viz artifacts (.h5/.xdmf) and processed/ stay ignored.
+!data/raw/
+!data/raw/*.npz
