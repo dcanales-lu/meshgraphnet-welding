@@ -113,7 +113,8 @@ def _as_normalizer(normalizer: NormalizerLike, device: torch.device) -> Normaliz
     """Coerce a NormalizeTransform / stats dict / stats.pt path to a normalizer
     with all constant tensors placed on ``device``."""
     if isinstance(normalizer, NormalizeTransform):
-        nt = normalizer
+        import copy
+        nt = copy.copy(normalizer)   # shallow copy — tensors reassigned below, original stays on CPU
     elif isinstance(normalizer, dict):
         nt = NormalizeTransform(normalizer)
     else:  # path to stats.pt

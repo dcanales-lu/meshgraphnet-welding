@@ -33,6 +33,7 @@ For a long RunPod run::
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -110,6 +111,8 @@ class TrainConfig:
     seed: int = 0
     device: str = "auto"
     progress_bar: bool = True
+    log_dir: str = "logs"           # directory for timestamped training log files
+    checkpoint_every: int = 50      # save epoch_NNNN.pt every N epochs (0 = disabled)
 
     # -- (de)serialization --------------------------------------------------
     @classmethod
@@ -279,6 +282,17 @@ def train(cfg: TrainConfig) -> dict:
     device = cfg.resolve_device()
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(cfg.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-epoch CSV loss log — written incrementally so it survives preemption.
+    csv_path = log_dir / "train_history.csv"
+    _csv_write_header = not csv_path.exists()   # append on resume, header on fresh run
+    csv_fh = open(csv_path, "a", newline="", encoding="utf-8")
+    csv_writer = csv.writer(csv_fh)
+    if _csv_write_header:
+        csv_writer.writerow(["epoch", "train_mse", "val_rollout_rmse", "lr"])
+        csv_fh.flush()
 
     # --- Data ---
     log.info("Loading dataset from %s ...", cfg.data_root)
@@ -296,6 +310,7 @@ def train(cfg: TrainConfig) -> dict:
     train_loader = DataLoader(
         subsets["train"], batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
     )
     val_results = _val_simulations(dataset, split.val_sims)
     if not val_results:
@@ -404,6 +419,20 @@ def train(cfg: TrainConfig) -> dict:
             last_path,
         )
 
+        # Append one row to the CSV loss log (flush so it's readable mid-run).
+        current_lr = optimizer.param_groups[0]["lr"]
+        val_str = f"{metric:.6f}" if (metric is not None and do_val) else ""
+        csv_writer.writerow([epoch, f"{train_loss:.6e}", val_str, f"{current_lr:.6e}"])
+        csv_fh.flush()
+
+        # Periodic epoch checkpoint (self-contained; no optimizer state needed).
+        if cfg.checkpoint_every > 0 and epoch % cfg.checkpoint_every == 0:
+            _atomic_save(
+                {"model_state": model.state_dict(), "config": asdict(cfg), "epoch": epoch},
+                ckpt_dir / f"epoch_{epoch:04d}.pt",
+            )
+            log.info("Periodic checkpoint -> %s/epoch_%04d.pt", cfg.checkpoint_dir, epoch)
+
         # Early stopping: stop once the val metric has stalled for `patience`
         # validations (only meaningful when we actually validate).
         if (cfg.early_stop_patience > 0 and metric is not None
@@ -440,6 +469,9 @@ def train(cfg: TrainConfig) -> dict:
             log.info("  %s -> rollout RMSE %.4f K", stem, rollout.rmse)
             exported.append(stem)
         history["exported_rollouts"] = exported
+
+    csv_fh.close()
+    log.info("Loss history CSV -> %s", csv_path)
 
     with open(ckpt_dir / "history.json", "w", encoding="utf-8") as fh:
         json.dump(history, fh, indent=2)
@@ -481,12 +513,23 @@ def config_from_args(argv: Optional[List[str]] = None) -> TrainConfig:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    # Parse config first so log_dir is known before setting up handlers.
     cfg = config_from_args(argv)
+
+    log_dir = Path(cfg.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    import time
+    log_filename = log_dir / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    fmt = "%(asctime)s | %(levelname)s | %(message)s"
+    datefmt = "%H:%M:%S"
+
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(),
+        logging.FileHandler(log_filename, encoding="utf-8"),
+    ]
+    logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt, handlers=handlers)
+    log.info("Logging to %s", log_filename)
     train(cfg)
 
 

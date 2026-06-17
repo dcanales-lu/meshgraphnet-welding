@@ -41,8 +41,9 @@ packages = [
 
 # ---------------------------------------------------------------------------
 # Platform-conditional PyTorch wheels:
-#   * Windows (local dev, no GPU) -> CPU wheels
-#   * Linux   (RunPod deployment) -> CUDA 12.4 wheels
+#   * Windows (local dev, RTX 5070 Blackwell sm_120) -> CUDA 12.8 wheels
+#   * Linux   (RunPod deployment)                    -> CUDA 12.8 wheels
+# cu128 is the first stable release to include sm_120 (Blackwell) kernels.
 # `uv sync` automatically selects the right index per platform.
 # ---------------------------------------------------------------------------
 [[tool.uv.index]]
@@ -55,14 +56,19 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
-    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
 ]
 torchvision = [
-    { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
-    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
 ]
 
 [tool.ruff]
