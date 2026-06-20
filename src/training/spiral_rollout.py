@@ -18,7 +18,7 @@ requested loop for every step:
 
     (a) evaluate the analytical Goldak field at the new source position,
     (b) rotate each node's relative displacement into the local (t̂, n̂) frame,
-    (c) assemble the 16-d node features (T, q_Goldak, co-moving coords, process
+    (c) assemble the 12-d node features (T, q_Goldak, co-moving coords, process
         params, one-hot interior/boundary flags + Robin values),
     (d) normalize, forward through the GNN, de-normalize ΔT, T^{t+1}=T^t+ΔT,
     (e) feed the temperature back for the next step.

@@ -72,8 +72,9 @@ from simulation.thermal_solver import (
 #: Gross arc power [W]; net power deposited is ``efficiency * power``.
 POWER_RANGE = (1500.0, 3500.0)
 EFFICIENCY_RANGE = (0.70, 0.90)
-#: Travel speed [m/s] (3-10 mm/s).
-SPEED_RANGE = (3.0e-3, 10.0e-3)
+#: Travel speed [m/s] (2-8 mm/s). The slower floor lengthens the weld phase so
+#: rollouts cover more autoregressive steps before the cooling tail begins.
+SPEED_RANGE = (2.0e-3, 8.0e-3)
 
 #: Goldak ellipsoid semi-axes [m].
 B_RANGE = (2.0e-3, 3.5e-3)        # transverse half-width (along normal)
@@ -387,9 +388,19 @@ def build_boundary_conditions(
 
 
 def build_simulation(
-    rng: np.random.Generator, h_el: float, target_steps: int
+    rng: np.random.Generator,
+    h_el: float,
+    target_steps: int,
+    min_cooling_steps: int = 60,
 ) -> Tuple[TransientThermalSolver, dict]:
-    """Sample one fully-specified simulation; return solver + provenance dict."""
+    """Sample one fully-specified simulation; return solver + provenance dict.
+
+    ``target_steps`` is the **total** snapshot budget (weld + cooling tail). The
+    time step is pinned near the spiral inference regime (~0.05 s); after the
+    weld finishes the heat source switches off and the simulation continues to
+    cool for at least ``min_cooling_steps`` steps, so the model is trained and
+    validated on long-horizon autoregressive rollouts.
+    """
     # Geometry.
     w = _u(rng, *WIDTH_RANGE)
     h = _u(rng, *HEIGHT_RANGE)
@@ -422,10 +433,21 @@ def build_simulation(
         geom, rng, t_ambient
     )
 
-    # Trajectory + time horizon.
-    traj, t_end, traj_kind = sample_trajectory(geom, rng, speed, goldak)
-    dt = float(np.clip(t_end / target_steps, 0.01, 0.05))
-    cfg = SolverConfig(dt=dt, t_end=t_end, verbose=False)
+    # Trajectory + weld-phase duration.
+    traj, t_weld, traj_kind = sample_trajectory(geom, rng, speed, goldak)
+
+    # Fixed time step in the spiral inference regime (~0.05 s, small jitter) so
+    # the learned per-step ΔT transfers to long inference rollouts.
+    dt = float(rng.uniform(0.045, 0.05))
+
+    # Post-weld cooling tail: extend the horizon to reach the total snapshot
+    # budget, with a guaranteed minimum cool-down even for already-long welds.
+    # The source switches OFF at ``t_weld`` (see SolverConfig.source_end_time).
+    t_cool = max(min_cooling_steps * dt, target_steps * dt - t_weld)
+    t_end = t_weld + t_cool
+    cfg = SolverConfig(
+        dt=dt, t_end=t_end, source_end_time=t_weld, verbose=False
+    )
 
     solver = TransientThermalSolver(geom.mesh, material, goldak, traj, bcs, cfg)
 
@@ -438,7 +460,15 @@ def build_simulation(
             "num_nodes": int(geom.mesh.p.shape[1]),
             "num_cells": int(geom.mesh.t.shape[1]),
         },
-        "trajectory": {"kind": traj_kind, "speed": speed, "t_end": t_end, "dt": dt},
+        "trajectory": {
+            "kind": traj_kind,
+            "speed": speed,
+            "dt": dt,
+            "t_weld": t_weld,
+            "t_cool": t_cool,
+            "t_end": t_end,
+            "source_end_time": t_weld,
+        },
         "boundary": {
             "h_conv": h_conv,
             "emissivity": emissivity,
@@ -458,6 +488,7 @@ def generate_split(
     base_seed: int,
     h_el: float,
     target_steps: int,
+    min_cooling_steps: int,
     save_xdmf: bool,
 ) -> List[Path]:
     """Generate ``count`` simulations for one split, with a clean tqdm bar."""
@@ -474,7 +505,9 @@ def generate_split(
         offset = (1 if split == "train" else 2) * 100_000
         seed = base_seed + offset + i
         rng = np.random.default_rng(seed)
-        solver, provenance = build_simulation(rng, h_el, target_steps)
+        solver, provenance = build_simulation(
+            rng, h_el, target_steps, min_cooling_steps
+        )
         result = solver.run()
         result.metadata["generation"] = {"split": split, "seed": seed, **provenance}
 
@@ -519,8 +552,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--target_steps",
         type=int,
-        default=80,
-        help="approximate number of time steps per simulation (sets dt)",
+        default=300,
+        help="total snapshot budget per simulation (weld + cooling tail) at the "
+        "fixed ~0.05 s spiral-regime dt",
+    )
+    p.add_argument(
+        "--min_cooling_steps",
+        type=int,
+        default=60,
+        help="minimum number of post-weld cooling steps (source off) even when "
+        "the weld phase already fills the target budget",
     )
     p.add_argument(
         "--save_xdmf",
@@ -539,7 +580,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         f"Generating dataset -> {raw_dir.resolve()}\n"
         f"  train={args.num_train}  val={args.num_val}  "
         f"element_size={args.element_size * 1e3:.2f} mm  "
-        f"~steps={args.target_steps}  seed={args.seed}"
+        f"~steps={args.target_steps} (weld+cool, >={args.min_cooling_steps} cool)  "
+        f"seed={args.seed}"
     )
     t0 = time.perf_counter()
     written: List[Path] = []
@@ -553,6 +595,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             args.seed,
             args.element_size,
             args.target_steps,
+            args.min_cooling_steps,
             args.save_xdmf,
         )
     elapsed = time.perf_counter() - t0

@@ -51,6 +51,10 @@ wandb/
 *.pt
 *.pth
 
+# Training logs (machine-specific, regenerable; kept on disk, not in git)
+logs/
+*.log
+
 # Generated output artifacts (rollout exports, videos, CSV/PNG analyses) — large
 # and regenerable; not needed on the training pod.
 data/output/

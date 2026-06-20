@@ -134,16 +134,16 @@ def test_goldak_feature_peaks_near_source():
 def test_bc_onehot_is_valid_and_dirichlet_overrides():
     result = _make_sim()
     g = build_graph_sequence(result)[0]
-    onehot = g.x[:, 10:13]
+    onehot = g.x[:, 6:9]
     # Exactly one node type per node.
     assert torch.allclose(onehot.sum(dim=1), torch.ones(g.num_nodes))
     # The left edge is Dirichlet -> those nodes flagged dirichlet, zero conv values.
     left_mask = torch.tensor(result.boundary_masks["left"])
-    assert torch.all(g.x[left_mask, 11] == 1.0)
-    assert torch.all(g.x[left_mask, 13:16] == 0.0)
+    assert torch.all(g.x[left_mask, 7] == 1.0)
+    assert torch.all(g.x[left_mask, 9:12] == 0.0)
     # Robin nodes carry the convection coefficient.
-    robin_nodes = g.x[:, 12] == 1.0
-    assert torch.all(g.x[robin_nodes, 13] == 15.0)
+    robin_nodes = g.x[:, 8] == 1.0
+    assert torch.all(g.x[robin_nodes, 9] == 15.0)
 
 
 def test_no_absolute_coordinates_in_features():
@@ -182,7 +182,7 @@ def test_dataset_processing_and_normalization(tmp_path):
     col_std = xs.std(dim=0, unbiased=False)
 
     # Columns that always vary in these sims must be ~zero-mean / unit-std.
-    varying = torch.tensor([0, 1, 2, 3, 13, 14, 15])  # T, q, dx', dy', h, eps, T_inf
+    varying = torch.tensor([0, 1, 2, 3, 9, 10, 11])  # T, q, dx', dy', h, eps, T_inf
     assert torch.all((col_std[varying] - 1.0).abs() < 1e-1)
     assert torch.all(xs[:, varying].mean(dim=0).abs() < 1e-1)
     # No column is over-amplified; one-hot/constant columns stay <= ~unit std.

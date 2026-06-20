@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import torch
 
@@ -57,6 +58,23 @@ def test_train_runs_and_checkpoints(tmp_path):
     assert len(history["train_loss"]) == cfg.epochs
     assert len(history["val_rmse"]) >= 1
     assert history["best_epoch"] >= 1
+    assert history["best_metric"] < float("inf")
+
+
+def test_pushforward_training_runs(tmp_path):
+    """K=3 push-forward + dynamic noise: full run completes with finite losses."""
+    _make_dataset(tmp_path, n_sims=4)
+    cfg = _tiny_config(tmp_path)
+    cfg.scheduler = "plateau"
+    cfg.pushforward_steps = 3
+    cfg.noise_beta = 0.03
+    cfg.noise_std = 0.0
+
+    history = train(cfg)
+
+    assert (tmp_path / "checkpoints" / "best_model.pt").exists()
+    assert len(history["train_loss"]) == cfg.epochs
+    assert all(math.isfinite(x) for x in history["train_loss"])
     assert history["best_metric"] < float("inf")
 
 

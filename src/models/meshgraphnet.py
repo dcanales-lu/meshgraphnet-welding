@@ -17,7 +17,7 @@ The forward pass maps per-node / per-edge input features to a per-node output
 * **Decoder**   — projects the final node latents down to ``out_dim``.
 
 The data contract from ``src/data/graph_builder.py`` is the intended input:
-``node_in_dim=16``, ``edge_in_dim=3``, ``out_dim=1`` (ΔT).
+``node_in_dim=12``, ``edge_in_dim=3``, ``out_dim=1`` (ΔT).
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class MeshGraphNetConfig:
         default), ``"mean"``, ``"max"``, ``"min"``.
     """
 
-    node_in_dim: int = 16
+    node_in_dim: int = 12
     edge_in_dim: int = 3
     out_dim: int = 1
     hidden_dim: int = 128
@@ -84,11 +84,11 @@ class MeshGraphNetConfig:
 
     # --- Optional GENERIC structure-preserving thermodynamic head ---
     use_generic: bool = False
-    #: Feature-column indices the GENERIC head reads (graph_builder 16-d layout).
+    #: Feature-column indices the GENERIC head reads (graph_builder 12-d layout).
     temperature_index: int = 0
     goldak_index: int = 1
-    robin_onehot_index: int = 12
-    t_inf_index: int = 15
+    robin_onehot_index: int = 8
+    t_inf_index: int = 11
 
     def activation_factory(self) -> Callable[[], nn.Module]:
         try:
@@ -319,7 +319,7 @@ class MeshGraphNet(nn.Module):
 
     Example
     -------
-    >>> cfg = MeshGraphNetConfig(node_in_dim=16, edge_in_dim=3, out_dim=1)
+    >>> cfg = MeshGraphNetConfig(node_in_dim=12, edge_in_dim=3, out_dim=1)
     >>> model = MeshGraphNet(cfg)
     >>> dT = model(x, edge_index, edge_attr)  # (num_nodes, 1)
     """

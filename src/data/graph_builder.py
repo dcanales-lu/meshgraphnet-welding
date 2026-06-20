@@ -17,10 +17,16 @@ Design principles (strong physical inductive biases)
 * Every operation (Goldak evaluation, frame rotation, edge construction) is
   vectorized.
 
-Node feature layout (16-d, see :data:`NODE_FEATURE_NAMES`)
+Node feature layout (12-d, see :data:`NODE_FEATURE_NAMES`)
 ----------------------------------------------------------
-``[T, q_Goldak, dx', dy', net_power, speed, a, b, c_f, c_r,
+``[T, q_Goldak, dx', dy', net_power, speed,
    onehot_interior, onehot_dirichlet, onehot_robin, h, emissivity, T_inf]``
+
+The Goldak semi-axes ``a, b, c_f, c_r`` are *global* process constants per
+simulation and are deliberately **not** exposed as separate node columns: they
+are already folded into the analytical ``q_Goldak`` source field and the
+co-moving coordinates ``dx', dy'``. They are still read from metadata to
+*compute* those features (see :func:`_goldak_from_metadata`).
 
 Edge feature layout (3-d): ``[dx, dy, ||u_ij||]`` with ``u_ij = x_i − x_j``.
 """
@@ -46,16 +52,12 @@ NODE_FEATURE_NAMES: List[str] = [
     "dy_local",     # 3  co-moving relative coord along normal
     "net_power",    # 4  process param: eta * P
     "speed",        # 5  process param: welding speed v
-    "a",            # 6  Goldak depth semi-axis
-    "b",            # 7  Goldak half-width
-    "c_f",          # 8  Goldak front semi-axis
-    "c_r",          # 9  Goldak rear semi-axis
-    "bc_interior",  # 10 one-hot node type
-    "bc_dirichlet", # 11 one-hot node type
-    "bc_robin",     # 12 one-hot node type
-    "h_conv",       # 13 local convection coefficient
-    "emissivity",   # 14 local emissivity
-    "T_inf",        # 15 local ambient temperature
+    "bc_interior",  # 6  one-hot node type
+    "bc_dirichlet", # 7  one-hot node type
+    "bc_robin",     # 8  one-hot node type
+    "h_conv",       # 9  local convection coefficient
+    "emissivity",   # 10 local emissivity
+    "T_inf",        # 11 local ambient temperature
 ]
 NUM_NODE_FEATURES = len(NODE_FEATURE_NAMES)
 EDGE_FEATURE_NAMES: List[str] = ["dx", "dy", "dist"]
@@ -66,9 +68,9 @@ NODE_TYPE_INTERIOR = 0
 NODE_TYPE_DIRICHLET = 1
 NODE_TYPE_ROBIN = 2
 
-# Continuous columns are z-score normalized; one-hot columns (10-12) are not.
+# Continuous columns are z-score normalized; one-hot columns (6-8) are not.
 NORMALIZE_MASK = np.ones(NUM_NODE_FEATURES, dtype=bool)
-NORMALIZE_MASK[[10, 11, 12]] = False
+NORMALIZE_MASK[[6, 7, 8]] = False
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +154,7 @@ def build_node_features(
     bc_values: np.ndarray,
     goldak: GoldakParams,
 ) -> np.ndarray:
-    """Assemble the (N, 16) node-feature matrix for snapshot index ``t``."""
+    """Assemble the (N, 12) node-feature matrix for snapshot index ``t``."""
     coords = result.coords
     n = coords.shape[0]
     pos = result.source_position[t]
@@ -166,8 +168,16 @@ def build_node_features(
     # Temperature.
     x[:, 0] = result.temperature[t]
 
-    # Analytical Goldak source at each node (reuses the solver's flux fn).
-    x[:, 1] = goldak_flux(
+    # Analytical Goldak source at each node (reuses the solver's flux fn). The
+    # flux is gated by the recorded on/off state of the torch: during a post-weld
+    # cooling tail ``source_power`` is 0, so the source feature is exactly 0
+    # (consistent with the FEM, which also switches the source off). The ratio is
+    # 1 while welding and degrades gracefully for any future power ramping.
+    net_power = md["net_power"]
+    power_ratio = (
+        result.source_power[t] / net_power if net_power > 0.0 else 0.0
+    )
+    x[:, 1] = power_ratio * goldak_flux(
         coords[:, 0], coords[:, 1], pos, tangent, normal, goldak, thickness
     )
 
@@ -177,18 +187,14 @@ def build_node_features(
     x[:, 3] = rel @ normal
 
     # Process parameters broadcast per node.
-    x[:, 4] = md["net_power"]
+    x[:, 4] = net_power
     x[:, 5] = speed
-    x[:, 6] = md["a"]
-    x[:, 7] = md["b"]
-    x[:, 8] = md["c_f"]
-    x[:, 9] = md["c_r"]
 
     # BC context: one-hot node type + local values.
-    x[:, 10] = node_type == NODE_TYPE_INTERIOR
-    x[:, 11] = node_type == NODE_TYPE_DIRICHLET
-    x[:, 12] = node_type == NODE_TYPE_ROBIN
-    x[:, 13:16] = bc_values
+    x[:, 6] = node_type == NODE_TYPE_INTERIOR
+    x[:, 7] = node_type == NODE_TYPE_DIRICHLET
+    x[:, 8] = node_type == NODE_TYPE_ROBIN
+    x[:, 9:12] = bc_values
 
     return x
 
@@ -214,7 +220,7 @@ def build_graph_sequence(
 ) -> List[Data]:
     """Convert a :class:`SimulationResult` into ``S-1`` PyG graphs.
 
-    Each graph holds ``x (N,16)``, ``edge_index (2,2E)``, ``edge_attr (2E,3)``,
+    Each graph holds ``x (N,12)``, ``edge_index (2,2E)``, ``edge_attr (2E,3)``,
     ``y (N,1)`` (the temperature increment), and ``pos (N,2)`` stored separately
     for visualization only (never used as a node feature).
     """

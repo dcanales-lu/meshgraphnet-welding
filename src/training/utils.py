@@ -37,7 +37,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from torch.utils.data import Dataset as TorchDataset
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
 from torch_geometric.transforms import BaseTransform, Compose
 
 from data.graph_builder import NODE_FEATURE_NAMES
@@ -45,6 +45,8 @@ from data.graph_builder import NODE_FEATURE_NAMES
 #: Index of the temperature column in the node-feature vector (robust to layout
 #: changes in the graph builder).
 TEMPERATURE_INDEX = NODE_FEATURE_NAMES.index("T")
+#: Index of the local ambient-temperature column (used to scale dynamic noise).
+T_INF_INDEX = NODE_FEATURE_NAMES.index("T_inf")
 
 
 # ---------------------------------------------------------------------------
@@ -347,3 +349,106 @@ def make_split_datasets(
         "val": TransformedSubset(dataset, split.val_indices, eval_transform),
         "test": TransformedSubset(dataset, split.test_indices, eval_transform),
     }
+
+
+# ---------------------------------------------------------------------------
+# 3. Dynamic (temperature-proportional) noise — applied inside the train loop
+# ---------------------------------------------------------------------------
+def dynamic_temperature_noise(
+    T: torch.Tensor,
+    T_inf: torch.Tensor,
+    beta: float,
+    floor: float = 0.0,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Add temperature-proportional Gaussian noise to a physical-kelvin field.
+
+    Per-node ``sigma_i = beta * |T_i - T_inf_i| + floor`` so the perturbation is
+    large near the melt pool (big ``|T - T_inf|``) and ~0 in the cold far-field
+    (``T ~ T_inf``). With ``beta = 0.03`` and a melt-pool excess of ~1400 K this
+    gives ``sigma ~ 42 K`` (the requested 30-50 K band). A pure no-op when
+    ``beta == 0`` and ``floor == 0``.
+
+    Parameters
+    ----------
+    T, T_inf:
+        ``(N,)`` physical temperature and local ambient temperature.
+    beta:
+        Proportional coefficient on ``|T - T_inf|``.
+    floor:
+        Constant additive sigma (kelvin); keeps a baseline noise everywhere.
+    generator:
+        Optional :class:`torch.Generator` for reproducibility.
+    """
+    if beta == 0.0 and floor == 0.0:
+        return T
+    sigma = beta * (T - T_inf).abs() + floor
+    eta = torch.randn(
+        T.shape, generator=generator, dtype=T.dtype, device=T.device
+    ) * sigma
+    return T + eta
+
+
+# ---------------------------------------------------------------------------
+# 4. Windowed dataset for push-forward (multi-step) training
+# ---------------------------------------------------------------------------
+class WindowedSubset(TorchDataset):
+    """Yield windows of ``K`` consecutive same-simulation graphs (raw, untransformed).
+
+    Push-forward training unrolls the model over ``K`` steps, so it needs the
+    consecutive graphs ``[g_t, g_{t+1}, ..., g_{t+K-1}]`` of one simulation. We
+    build the list of valid window-start indices from the base dataset's
+    deterministic ``_index`` (``[(fname, sim_idx, t)]``, ordered by ``(sim, t)``):
+    a start ``i`` is valid iff ``i`` belongs to a training simulation and the
+    ``K``-th entry shares its ``sim_idx`` (guaranteeing ``K`` consecutive steps
+    that never cross a simulation boundary).
+
+    ``__getitem__`` returns the raw graphs via ``base.get`` (bypassing any
+    dataset-level transform); normalization and noise are applied later, inside
+    the unrolled training loop.
+    """
+
+    def __init__(self, base_dataset, train_sims: Sequence[int], k: int):
+        if k < 1:
+            raise ValueError(f"pushforward window k must be >= 1, got {k}")
+        self.base = base_dataset
+        self.k = int(k)
+        index = getattr(base_dataset, "_index", None)
+        if index is None:
+            raise ValueError(
+                "WindowedSubset requires a dataset exposing the deterministic "
+                "`_index` (e.g. WeldingGraphDataset)."
+            )
+        train = {int(s) for s in train_sims}
+        self.starts: List[int] = []
+        n = len(index)
+        for i in range(n - self.k + 1):
+            sim_i = int(index[i][1])
+            if sim_i not in train:
+                continue
+            # _index is contiguous per sim, so same sim_idx at both ends => the
+            # K entries in between are consecutive steps of that simulation.
+            if int(index[i + self.k - 1][1]) == sim_i:
+                self.starts.append(i)
+
+    def __len__(self) -> int:
+        return len(self.starts)
+
+    def __getitem__(self, j: int) -> List[Data]:
+        i = self.starts[j]
+        return [self.base.get(i + k) for k in range(self.k)]
+
+
+def collate_windows(batch: List[List[Data]]) -> List[Batch]:
+    """Collate a list of windows into ``K`` step-aligned PyG mini-batches.
+
+    ``batch`` is ``B`` windows, each a list of ``K`` graphs. Returns a list of
+    ``K`` :class:`~torch_geometric.data.Batch` objects, where batch ``k`` bundles
+    the ``k``-th graph of every window. Because the graphs within a window are
+    consecutive steps of the *same* simulation (identical node ordering) and the
+    windows are concatenated in the same order at every ``k``, node ``j`` of
+    batch ``k`` corresponds to node ``j`` of batch ``k+1`` — so a single per-node
+    ``T_hat`` vector can be rolled through the unroll.
+    """
+    k = len(batch[0])
+    return [Batch.from_data_list([window[step] for window in batch]) for step in range(k)]

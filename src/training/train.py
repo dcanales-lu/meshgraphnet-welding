@@ -43,17 +43,20 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-from torch_geometric.loader import DataLoader
+from torch.utils.data import DataLoader as TorchDataLoader
 
-from data.graph_builder import WeldingGraphDataset
+from data.graph_builder import NUM_NODE_FEATURES, WeldingGraphDataset
 from models.meshgraphnet import MeshGraphNet, MeshGraphNetConfig
 from simulation.thermal_solver import SimulationResult
-from training.rollout import export_rollout, run_autoregressive_rollout
+from training.rollout import _as_normalizer, export_rollout, run_autoregressive_rollout
 from training.utils import (
+    TEMPERATURE_INDEX,
+    T_INF_INDEX,
     TrainingConfig,
-    make_split_datasets,
+    WindowedSubset,
+    collate_windows,
+    dynamic_temperature_noise,
     split_by_simulation,
 )
 
@@ -88,8 +91,18 @@ class TrainConfig:
     # resume from <checkpoint_dir>/last_model.pt (intended for plateau/cosine)
     resume: bool = False
 
-    # training-noise injection (kelvin; applied to raw temperature, train only)
+    # training-noise injection (kelvin; applied to raw temperature, train only).
+    # Effective per-node sigma = noise_beta * |T - T_inf| + floor, where
+    # floor = noise_floor if > 0 else noise_std (so legacy configs that only set
+    # noise_std keep a constant noise floor).
     noise_std: float = 5.0
+    noise_beta: float = 0.0    # proportional coefficient on |T - T_inf| (dynamic noise)
+    noise_floor: float = 0.0   # additive constant sigma floor (kelvin)
+
+    # push-forward / multi-step training: unroll K consecutive steps and backprop
+    # the joint loss through the model's own fed-back predictions. K=1 => classic
+    # single-step (teacher forcing) with dynamic noise.
+    pushforward_steps: int = 1
 
     # model
     hidden_dim: int = 128
@@ -132,7 +145,7 @@ class TrainConfig:
     # -- derived configs ----------------------------------------------------
     def model_config(self) -> MeshGraphNetConfig:
         return MeshGraphNetConfig(
-            node_in_dim=16, edge_in_dim=3, out_dim=1,
+            node_in_dim=NUM_NODE_FEATURES, edge_in_dim=3, out_dim=1,
             hidden_dim=self.hidden_dim,
             num_mlp_layers=self.num_mlp_layers,
             num_processing_steps=self.num_processing_steps,
@@ -219,9 +232,28 @@ def _build_scheduler(optimizer, cfg: TrainConfig, steps_per_epoch: int):
 # Train / validate
 # ---------------------------------------------------------------------------
 def _train_one_epoch(model, loader, optimizer, scheduler, sched_mode, device,
-                     grad_clip, progress_bar, epoch, epochs) -> float:
+                     grad_clip, progress_bar, epoch, epochs, nt, cfg) -> float:
+    """One push-forward epoch: unroll ``K`` steps and backprop the joint loss.
+
+    Each item from the windowed loader is a list of ``K`` step-aligned PyG
+    Batches ``[B_0, ..., B_{K-1}]``. We seed temperature from the (dynamically
+    noised) true field at the window start, then roll the model forward — feeding
+    its own prediction back as the next input's temperature column — and sum the
+    physical-temperature MSE (scaled by the temperature std) across the window,
+    backpropagating through the whole unroll (full BPTT). ``K=1`` recovers the
+    classic single-step objective with dynamic noise.
+
+    Reuses the inference feed-forward of :func:`rollout.run_autoregressive_rollout`
+    (overwrite temperature column -> standardize -> model -> ``inverse_y`` ΔT ->
+    ``T += dT``), but differentiable.
+    """
     model.train()
     total, n = 0.0, 0
+
+    mask = nt.mask.bool()
+    t_scale = nt.x_std[TEMPERATURE_INDEX].clamp_min(1e-6)
+    beta = cfg.noise_beta
+    floor = cfg.noise_floor if cfg.noise_floor > 0.0 else cfg.noise_std
 
     iterator = loader
     if progress_bar:
@@ -232,11 +264,32 @@ def _train_one_epoch(model, loader, optimizer, scheduler, sched_mode, device,
         except ImportError:
             pass
 
-    for batch in iterator:
-        batch = batch.to(device)
+    for window in iterator:
+        steps = [b.to(device) for b in window]   # [B_0, ..., B_{K-1}]
+        b0 = steps[0]
         optimizer.zero_grad()
-        pred = model(batch.x, batch.edge_index, batch.edge_attr, batch=batch.batch)
-        loss = F.mse_loss(pred, batch.y)        # MSE on normalized ΔT
+
+        # Seed T from the window start, perturbed by temperature-proportional noise.
+        T_hat = dynamic_temperature_noise(
+            b0.x[:, TEMPERATURE_INDEX].clone(), b0.x[:, T_INF_INDEX],
+            beta=beta, floor=floor,
+        )
+
+        loss = b0.x.new_zeros(())
+        for bk in steps:
+            x = bk.x.clone()
+            x[:, TEMPERATURE_INDEX] = T_hat              # roll our own prediction in
+            x_norm = x.clone()
+            x_norm[:, mask] = (x[:, mask] - nt.x_mean[mask]) / nt.x_std[mask]
+            dT = nt.inverse_y(
+                model(x_norm, bk.edge_index, bk.edge_attr, batch=bk.batch)
+            ).squeeze(-1)
+            T_pred = T_hat + dT
+            T_true = bk.x[:, TEMPERATURE_INDEX] + bk.y[:, 0]   # physical T_{t+k+1}
+            loss = loss + (((T_pred - T_true) / t_scale) ** 2).mean()
+            T_hat = T_pred                               # feed forward (no detach -> BPTT)
+        loss = loss / len(steps)
+
         loss.backward()
         if grad_clip > 0:
             clip_grad_norm_(model.parameters(), grad_clip)
@@ -244,8 +297,9 @@ def _train_one_epoch(model, loader, optimizer, scheduler, sched_mode, device,
         if scheduler is not None and sched_mode == "batch":
             scheduler.step()
 
-        total += float(loss.detach()) * batch.num_graphs
-        n += batch.num_graphs
+        nb = b0.num_graphs
+        total += float(loss.detach()) * nb
+        n += nb
         if progress_bar and hasattr(iterator, "set_postfix"):
             iterator.set_postfix(loss=f"{loss.item():.3e}",
                                  lr=f"{optimizer.param_groups[0]['lr']:.2e}")
@@ -306,12 +360,21 @@ def train(cfg: TrainConfig) -> dict:
     )
     log.info("%s", split.summary())
 
-    subsets = make_split_datasets(dataset, cfg.data_config(), normalizer, split=split)
-    train_loader = DataLoader(
-        subsets["train"], batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers,
+    # Push-forward training consumes windows of K consecutive same-sim graphs
+    # (raw; noise + normalization are applied inside the unrolled loop).
+    train_windows = WindowedSubset(dataset, split.train_sims, k=cfg.pushforward_steps)
+    log.info("Push-forward: K=%d | %d training windows from %d sims",
+             cfg.pushforward_steps, len(train_windows), len(split.train_sims))
+    train_loader = TorchDataLoader(
+        train_windows, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, collate_fn=collate_windows,
         pin_memory=(device.type == "cuda"),
+        # Keep workers alive across epochs (avoids costly per-epoch re-spawn on
+        # Windows). Only valid when num_workers > 0.
+        persistent_workers=(cfg.num_workers > 0),
     )
+    # Device-resident normalizer for the in-loop standardize / de-normalize.
+    train_normalizer = _as_normalizer(normalizer, device)
     val_results = _val_simulations(dataset, split.val_sims)
     if not val_results:
         log.warning("No validation simulations; checkpointing on train loss instead.")
@@ -358,6 +421,7 @@ def train(cfg: TrainConfig) -> dict:
         train_loss = _train_one_epoch(
             model, train_loader, optimizer, scheduler, sched_mode, device,
             cfg.grad_clip, cfg.progress_bar, epoch, cfg.epochs,
+            train_normalizer, cfg,
         )
 
         do_val = val_results and (epoch % cfg.val_every == 0 or epoch == cfg.epochs)

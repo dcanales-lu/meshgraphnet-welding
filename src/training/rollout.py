@@ -19,7 +19,7 @@ Key design points
   the schedule is deterministic.
 * **No absolute positioning in the network.** The model is called as
   ``model(x, edge_index, edge_attr)``; ``x`` carries only relative/physical
-  features (16-d, no coordinates). Coordinates are used solely to *compute*
+  features (12-d, no coordinates). Coordinates are used solely to *compute*
   ``q_Goldak`` / ``[dx', dy']`` (inside ``build_graph_sequence``), never fed in.
 * **Normalization.** Node features are standardized with the saved
   :class:`NormalizeTransform` constants (``stats.pt``); the predicted normalized
@@ -187,7 +187,7 @@ def run_autoregressive_rollout(
     # truth* T^t, which we overwrite with the rolled prediction during the loop.
     graphs = build_graph_sequence(result, sim_id=sim_id)
     n_steps = len(graphs)  # = S - 1
-    feats = torch.stack([g.x for g in graphs]).to(device)        # (S-1, N, 16)
+    feats = torch.stack([g.x for g in graphs]).to(device)        # (S-1, N, 12)
     edge_index = graphs[0].edge_index.to(device)
     edge_attr = graphs[0].edge_attr.to(device)                   # raw, unnormalized
 

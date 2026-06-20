@@ -147,6 +147,11 @@ class SolverConfig:
     picard_tol: float = 1e-4
     snapshot_every: int = 1
     verbose: bool = True
+    #: Time [s] at which the heat source switches OFF. For ``t > source_end_time``
+    #: the Goldak load is zero (post-weld cooling tail) and the torch is parked at
+    #: its position at ``source_end_time``. ``None`` keeps the source on for the
+    #: whole horizon (the original behaviour).
+    source_end_time: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -531,11 +536,36 @@ class TransientThermalSolver:
             rhs += rad_rhs.assemble(fb, T=fb.interpolate(T))
         return R, rhs
 
+    def _source_is_on(self, s: float) -> bool:
+        """Whether the heat source is active at time ``s`` (off during cooling)."""
+        end = self.cfg.source_end_time
+        return end is None or s <= end
+
+    def _traj_time(self, s: float) -> float:
+        """Trajectory query time, clamped to the weld end during cooling.
+
+        Once the source is off the torch is parked at its ``source_end_time``
+        position, so co-moving coordinates stay finite instead of extrapolating
+        the path off the plate.
+        """
+        end = self.cfg.source_end_time
+        return s if end is None else min(s, end)
+
     def _assemble_source(self, s: float):
-        """Goldak source load vector at trajectory time ``s``."""
-        pos = self.traj.position(s)
-        tangent = self.traj.tangent(s)
-        normal = self.traj.normal(s)
+        """Goldak source load vector at trajectory time ``s``.
+
+        Returns ``(load, pos, tangent, normal)``. During the post-weld cooling
+        tail (``s > source_end_time``) the load is the zero vector (torch off);
+        the parked-torch frame is still returned for snapshot recording.
+        """
+        sq = self._traj_time(s)
+        pos = self.traj.position(sq)
+        tangent = self.traj.tangent(sq)
+        normal = self.traj.normal(sq)
+
+        if not self._source_is_on(s):
+            return np.zeros(self.N), pos, tangent, normal
+
         params = self.goldak
         thickness = self.mat.thickness
 
@@ -612,12 +642,13 @@ class TransientThermalSolver:
         src_pos, src_tan, src_nor, src_pow = [], [], [], []
 
         def record(s: float, Tcur: np.ndarray):
+            sq = self._traj_time(s)  # parked at the weld end during cooling
             times.append(s)
             temps.append(Tcur.copy())
-            src_pos.append(self.traj.position(s))
-            src_tan.append(self.traj.tangent(s))
-            src_nor.append(self.traj.normal(s))
-            src_pow.append(self.goldak.net_power)
+            src_pos.append(self.traj.position(sq))
+            src_tan.append(self.traj.tangent(sq))
+            src_nor.append(self.traj.normal(sq))
+            src_pow.append(self.goldak.net_power if self._source_is_on(s) else 0.0)
 
         record(0.0, T)
 

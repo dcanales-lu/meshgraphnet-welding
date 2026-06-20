@@ -1,197 +1,226 @@
-# Launching training on RunPod — step by step
+# Running on RunPod (cloud GPU) — step by step
 
-A complete walkthrough to run the MeshGraphNet welding surrogate on a RunPod GPU
-pod: from the RunPod website to a training run going on the persistent volume,
-detached so it survives closing the console, and resumable across spot-instance
-preemption.
+A no-Docker workflow that mirrors local training: spin up a standard GPU pod,
+clone the repo onto the persistent `/workspace` volume, reproduce the env with
+`uv`, run **detached**, and **auto-stop the pod** when training finishes so you
+don't pay for idle GPU time. Resumable across spot-instance preemption.
 
-The dataset (`data/raw/*.npz`, ~19 MB) is committed to the repo, so a single
-`git clone` brings **code + data** to the pod.
+> The codebase is already cloud-ready: matplotlib runs headless
+> (`matplotlib.use("Agg")`), all paths are relative, `pyproject.toml` selects the
+> Linux **cu128** torch wheels, and `uv.lock` + `.python-version` (3.12) pin the
+> exact environment.
 
 **Why a network volume?** Only the volume (mounted at `/workspace`) survives a
-pod stop/preemption — the container disk is wiped. Everything the run *writes*
-(checkpoints, rollout exports, the processed-graph cache) must live on it. The
-steps below clone into `/workspace` **and** point `--checkpoint_dir` at an
-absolute volume path outside the repo, so the model survives even a re-clone.
+pod stop / terminate / preemption — the container disk is wiped. Everything the
+run writes (checkpoints, logs, the processed-graph cache) lives on it.
 
 ---
 
 ## Step 0 — Make the repo cloneable (one-time, on your machine)
 
-If the repo is **private**, the pod can't clone it without auth. Easiest fix —
-make it public (it's just code + the dataset, no secrets):
+If the repo is **private**, the pod can't clone it without auth. Either make it
+public (it's just code + dataset, no secrets):
 
 ```bash
 gh repo edit dcanales-lu/meshgraphnet-welding --visibility public --accept-visibility-change-consequences
 ```
 
-Keeping it private? Skip this and use a token in Step 3 (variant shown there).
+…or keep it private and use a token in Step 3 (variant shown there).
+
+**Push the current state** so the pod gets the latest code, the new 125-sim
+dataset, and the cloud scripts:
+
+```bash
+git add data/raw/*.npz config.runpod.json config.local_gpu*.json src scripts RUNPOD.md
+git commit -m "Cloud workflow: refreshed runpod config + auto-shutdown wrapper"
+git push
+```
+
+(The dataset is committed via a `.gitignore` exception so one `git clone` brings
+**code + data**. Alternatively, skip committing data and regenerate it on the
+pod — see Step 3b — since the generator is seeded and deterministic.)
 
 ---
 
 ## Step 1 — Create the pod on runpod.io
 
-1. Log in → **Pods** (or "GPU Cloud") → **Deploy**.
-2. **GPU:** one mid-range card — **RTX 4090** or **A5000** is plenty
-   (`hidden_dim=128`, 8 message-passing steps).
-3. **Template:** a **PyTorch 2.x / CUDA 12.4** template (e.g. "RunPod PyTorch 2.4").
-4. **Network Volume:** create/attach one (e.g. 20 GB). It mounts at **`/workspace`**
-   — the storage that survives preemption.
-5. **Instance type:** **Spot/Interruptible** (cheaper; the run resumes after a kill).
-6. **Deploy**, and wait until the pod status is **Running**.
+1. **Pods → Deploy.**
+2. **GPU:** the model is tiny (~1.3M params); the real bottleneck is **data
+   loading**, so prefer a pod with **≥8 vCPUs**. An RTX 4090 / A5000 / L40S is
+   plenty. Pick a bigger GPU only if you also scale `hidden_dim` / `batch_size` /
+   dataset.
+3. **Template:** any official **PyTorch / CUDA 12.x** template (recent NVIDIA
+   driver). `uv` pulls the **cu128** torch wheels regardless of the base image.
+4. **Network Volume:** create/attach one (~20 GB) mounted at **`/workspace`**.
+5. **Instance type:** **Spot/Interruptible** is cheaper and the run resumes after
+   a kill (Step 6). Use On-Demand if you don't want interruptions.
+6. **Deploy** and wait for **Running**.
 
 ---
 
 ## Step 2 — Open the terminal
 
-On the pod card → **Connect** → **Start Web Terminal** → **Connect to Web
-Terminal**. (Or use the "SSH over exposed TCP" command for your own terminal.)
+Pod card → **Connect** → **Start Web Terminal**. (Or use the SSH-over-TCP command
+for your own terminal.)
 
 ---
 
 ## Step 3 — Set up (copy-paste the whole block)
 
 ```bash
-export VOL=/workspace
-mkdir -p "$VOL/checkpoints" "$VOL/output"
-cd "$VOL"
+cd /workspace
 
 # Clone code + data onto the volume:
 git clone https://github.com/dcanales-lu/meshgraphnet-welding.git
 cd meshgraphnet-welding
 
-# Install uv + dependencies (auto-selects CUDA 12.4 torch wheels on Linux):
+# Install uv + reproduce the EXACT env from uv.lock (pulls cu128 torch on Linux):
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
-uv sync
+uv sync --frozen
 
-# Confirm the GPU is visible:
-uv run python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+# Confirm the GPU is visible (must print True + the card name):
+uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-The last line must print `CUDA: True`. If it prints `False`, the template isn't a
-CUDA one — redeploy with a PyTorch CUDA 12.4 template.
+If CUDA is `False`, the driver/template is wrong — redeploy with a CUDA 12.x
+template. `.venv/` lives on the volume, so on later pods `uv sync --frozen` is a
+near-no-op.
 
 > **Private-repo variant:** replace the clone line with
 > `git clone https://<TOKEN>@github.com/dcanales-lu/meshgraphnet-welding.git`
 > (GitHub → Settings → Developer settings → fine-grained token, read access).
 
----
-
-## Step 4 — Launch training, detached
-
-Run inside **tmux** so it survives closing the web console:
+**Step 3b — regenerate data on the pod (only if you did NOT commit it):**
 
 ```bash
-apt-get update && apt-get install -y tmux     # if tmux isn't already there
+uv run python -m src.simulation.generate_dataset --num_train 100 --num_val 25 --target_steps 300
+```
+
+The `data/processed/` graph cache builds automatically on the first training run.
+
+---
+
+## Step 4 — Launch training, detached + auto-shutdown
+
+Use the wrapper `scripts/runpod_train.sh`: it runs `uv sync` → training →
+optional eval, then **stops the pod on any exit** (success, crash, or sync error)
+via `runpodctl` (pre-installed on pods; reads `RUNPOD_POD_ID` automatically).
+Run it inside **tmux** so it survives closing the web console:
+
+```bash
+apt-get update && apt-get install -y tmux     # if tmux isn't already present
 tmux new -s train
+
+# inside tmux:
+bash scripts/runpod_train.sh config.runpod.json
 ```
 
-Inside the tmux session, start the run (artifacts go to the volume):
+**Detach:** press **`Ctrl+b`** then **`d`** — training keeps running; close the
+browser tab safely. **Reattach:** `tmux attach -t train`.
+
+Within a minute you'll see:
+
+```
+DataSplit(train: 94 sims / ~32k graphs, val: 31 sims / ~11k graphs, ...)
+MeshGraphNet on cuda | 1291777 params | 8 processing steps
+epoch   5/100 | train_mse 9.7e-02 | val_rollout_rmse 147.7 K  <- best
+```
+
+What `config.runpod.json` does (tuned cloud recipe): up to **100 epochs**,
+**cosine** LR decay, validates every 5 epochs via full autoregressive-rollout
+RMSE, de-noised validation (`val_fraction 0.25`), `batch_size 16`,
+`num_workers 8`, `progress_bar false` (clean logs). Override any field from the
+CLI, e.g. `--hidden_dim 192 --num_processing_steps 12 --epochs 150`.
+
+**No-tmux alternative (`nohup`):**
 
 ```bash
-export VOL=/workspace
-uv run python -m src.training.train --config config.runpod.json \
-  --checkpoint_dir "$VOL/checkpoints" \
-  --rollout_pred_dir "$VOL/output/rollout_pred"
+nohup bash scripts/runpod_train.sh config.runpod.json > logs/nohup.out 2>&1 &
+tail -f logs/nohup.out
 ```
 
-Within a minute you should see lines like:
+### Auto-shutdown controls (cost optimization)
 
-```
-DataSplit(train: 20 sims / 3790 graphs, val: 5 sims / 993 graphs, ...)
-MeshGraphNet on cuda | ... params | 8 processing steps
-epoch   2/2000 | train_mse 2.1e-01 | val_rollout_rmse 206.6 K  <- best
-```
-
-**Detach the console:** press **`Ctrl+b`**, then **`d`**. Training keeps
-running — close the browser tab safely.
-
-What this run does (`config.runpod.json`):
-- up to **2000 epochs** with the **plateau** LR scheduler;
-- validates every 2 epochs via full autoregressive-rollout RMSE;
-- **early-stops** after **25 validations** with no improvement;
-- writes to `$VOL/checkpoints/`: `best_model.pt` (deploy this), `last_model.pt`
-  (atomic resume anchor), `config.json`, `stats.pt`, `history.json`.
-
-Tune from the CLI without editing the file (CLI overrides JSON), e.g.
-`--epochs 4000 --early_stop_patience 40 --hidden_dim 192 --num_processing_steps 12`.
-
-Prefer no tmux? Use `nohup` (logs to the volume):
+The wrapper waits a 30 s grace window (Ctrl-C to cancel if attached), then:
 
 ```bash
-nohup uv run python -m src.training.train --config config.runpod.json \
-  --checkpoint_dir "$VOL/checkpoints" --rollout_pred_dir "$VOL/output/rollout_pred" \
-  > "$VOL/train.log" 2>&1 &
-tail -f "$VOL/train.log"
+# Default — stop the pod (GPU billing ends, resumable):
+bash scripts/runpod_train.sh config.runpod.json
+
+# Terminate fully — ends ALL pod billing; /workspace volume persists:
+SHUTDOWN_ACTION=remove bash scripts/runpod_train.sh config.runpod.json
+
+# Stay up afterwards (debugging):
+SHUTDOWN_ACTION=none bash scripts/runpod_train.sh config.runpod.json
+
+# Run a spiral eval after training, before shutdown:
+POST_TRAIN_CMD='uv run python -m src.training.spiral_rollout --checkpoint checkpoints/best_model.pt --output_name spiral_runpod --device cuda && uv run python -m src.training.spiral_analysis --pred data/output/spiral_runpod.npz --prefix spiral_runpod' \
+  bash scripts/runpod_train.sh config.runpod.json
+```
+
+**`stop` vs `remove`:** `stop` halts the GPU (you still pay a small idle disk
+rate; resume the same pod later). `remove` terminates the pod entirely (zero pod
+cost; the `/workspace` network volume is billed separately and keeps code +
+checkpoints + logs). For unattended overnight runs you won't resume, `remove` is
+cheapest.
+
+> Backstop: if `runpodctl` is ever missing/unauthenticated the wrapper logs a
+> warning and leaves the pod up — **verify in the console**, and set a pod
+> spending/runtime limit as a safety net.
+
+---
+
+## Step 5 — Monitor
+
+```bash
+tail -f logs/train_*.log     # one line per epoch (+ val_rollout_rmse on val epochs)
+nvidia-smi -l 5              # GPU utilization / memory
+tmux attach -t train         # full live view; Ctrl+b d to detach again
 ```
 
 ---
 
-## Step 5 — Check back / monitor
+## Step 6 — Resume after a spot kill
 
-Open a web terminal any time and reattach:
-
-```bash
-tmux attach -t train          # watch live; Ctrl+b then d to detach again
-```
-
-Or peek without attaching:
+Relaunch a pod with the **same network volume**, open a terminal, set
+`"resume": true` in `config.runpod.json` (or pass `--resume`), and rerun:
 
 ```bash
-cat /workspace/checkpoints/history.json
-ls -la /workspace/checkpoints/
-```
-
----
-
-## Step 6 — If the spot pod gets killed, resume
-
-Relaunch a pod with the **same network volume** attached, open a terminal, then
-rerun with the **same `--checkpoint_dir`** plus `--resume`:
-
-```bash
-export VOL=/workspace
-cd "$VOL/meshgraphnet-welding"
+cd /workspace/meshgraphnet-welding
 tmux new -s train
-uv run python -m src.training.train --config config.runpod.json \
-  --checkpoint_dir "$VOL/checkpoints" \
-  --rollout_pred_dir "$VOL/output/rollout_pred" \
-  --resume
+bash scripts/runpod_train.sh config.runpod.json   # with resume:true in the config
 ```
 
-You'll see `Resumed from .../last_model.pt at epoch N` and it continues. Resume
-targets the `plateau`/`cosine` schedulers; `onecycle` does not resume cleanly
-(its LR curve is fixed to the original total step count).
+You'll see `Resumed from .../last_model.pt at epoch N`. Resume targets
+`plateau`/`cosine`; `onecycle` does not resume cleanly (fixed LR curve).
 
 ---
 
 ## Step 7 — Download the trained model
 
+Checkpoints/logs/plots are git-ignored, so pull them off the pod:
+
 ```bash
-runpodctl send /workspace/checkpoints/best_model.pt \
-  /workspace/checkpoints/stats.pt /workspace/checkpoints/config.json
+# On the pod — prints a one-time code:
+runpodctl send checkpoints/best_model.pt checkpoints/stats.pt checkpoints/config.json
+
+# On your laptop:
+runpodctl receive <code>
 ```
 
-This prints a one-time code; run the matching `runpodctl receive <code>` on your
-laptop. (Or download `/workspace/checkpoints/` from the RunPod file browser.)
 `best_model.pt` is self-contained (bundles its `config`); with `stats.pt` you can
-run inference / rollouts locally via `src.training.rollout`.
+run rollouts locally via `src.training.rollout`. If you use
+`SHUTDOWN_ACTION=remove`, fetch results via `POST_TRAIN_CMD` + `runpodctl send`
+**before** the run ends, or just leave them on `/workspace` and re-mount the
+volume next time.
 
 ---
 
-## Step 8 — Stop the pod
+## Step 8 — Cost notes
 
-When training is done and the model is downloaded, **Stop/Terminate** the pod so
-you stop paying. Your artifacts remain on the network volume.
-
----
-
-### Notes
-- FEM dataset generation (`src.simulation.generate_dataset`) is **CPU-bound** —
-  do it locally and commit the `.npz`, not on the paid GPU pod.
-- To train on a larger dataset later: generate more sims locally, commit the new
-  `data/raw/*.npz`, and re-clone (or `git pull`) on the pod.
-- The repo lives on the volume, so the processed-graph cache it writes under
-  `data/processed/` is persistent too. If you instead clone onto the container
-  disk, add `--data_root "$VOL/data"` to keep that cache on the volume.
+- Auto-shutdown (Step 4) means you normally **don't** stop the pod manually.
+- FEM dataset generation is **CPU-bound** — do it locally and commit the `.npz`,
+  or regenerate on the pod once (Step 3b); don't burn GPU hours on it.
+- To scale up: bump `hidden_dim` 128→192/256, `num_processing_steps` 8→10–12,
+  `batch_size`/`num_workers` to fit the GPU/vCPUs, or generate more/longer sims.

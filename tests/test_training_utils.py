@@ -12,6 +12,9 @@ from training.utils import (
     TemperatureNoiseInjection,
     TrainingConfig,
     TransformedSubset,
+    WindowedSubset,
+    collate_windows,
+    dynamic_temperature_noise,
     make_split_datasets,
     simulation_ids_from_dataset,
     split_by_simulation,
@@ -177,4 +180,63 @@ def test_make_split_datasets_train_noisy_val_clean(tmp_path):
 
     # The PyG DataLoader batches the subsets.
     batch = next(iter(DataLoader(subsets["train"], batch_size=2, shuffle=False)))
-    assert batch.x.shape[1] == 16 and batch.y.shape[1] == 1
+    assert batch.x.shape[1] == 12 and batch.y.shape[1] == 1
+
+
+# ---------------------------------------------------------------------------
+# 3. Dynamic (temperature-proportional) noise
+# ---------------------------------------------------------------------------
+def test_dynamic_temperature_noise_scales_with_excess():
+    gen = torch.Generator().manual_seed(0)
+    # Node 0: melt-pool excess 1400 K; node 1: far-field (T == T_inf).
+    T = torch.tensor([1700.0, 300.0])
+    T_inf = torch.tensor([300.0, 300.0])
+    n = 8000
+    Tg = T.expand(n, 2).contiguous()
+    Tig = T_inf.expand(n, 2).contiguous()
+
+    out = dynamic_temperature_noise(Tg, Tig, beta=0.03, floor=0.0, generator=gen)
+    std = (out - Tg).std(dim=0)
+
+    assert abs(std[0].item() - 0.03 * 1400) < 5.0   # ~42 K near the melt pool
+    assert std[1].item() < 1.0                       # ~0 K in the cold far-field
+    assert (out - Tg).mean().abs().item() < 2.0      # zero-mean perturbation
+
+    # No-op when both knobs are off.
+    assert torch.equal(dynamic_temperature_noise(Tg, Tig, beta=0.0, floor=0.0), Tg)
+
+
+# ---------------------------------------------------------------------------
+# 4. Windowed dataset for push-forward training
+# ---------------------------------------------------------------------------
+def test_windowed_subset_validity_and_collate(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    for i in range(3):
+        _make_sim(t_end=0.3, dt=0.05).save_npz(raw / f"sim_{i:03d}")
+    ds = WeldingGraphDataset(root=tmp_path)
+    sims = sorted({si for (_, si, _) in ds._index})
+
+    k = 3
+    win = WindowedSubset(ds, sims, k=k)
+    assert len(win) > 0
+
+    for w in win:
+        assert len(w) == k
+        # Every window is K consecutive snapshots of a *single* simulation.
+        assert len({int(g.sim_id) for g in w}) == 1
+        times = [float(g.time) for g in w]
+        assert times[0] < times[1] < times[2]
+
+    # A window must not start within (K-1) steps of a simulation's end, so a sim
+    # with `m` graphs contributes exactly `m-(K-1)` windows.
+    from collections import Counter
+    per_sim = Counter(si for (_, si, _) in ds._index)
+    expected = sum(max(m - (k - 1), 0) for m in per_sim.values())
+    assert len(win) == expected
+
+    # collate -> K step-aligned batches, node-count-consistent across steps.
+    batch = collate_windows([win[0], win[1 % len(win)]])
+    assert len(batch) == k
+    n_nodes = batch[0].num_nodes
+    assert all(b.num_nodes == n_nodes for b in batch)

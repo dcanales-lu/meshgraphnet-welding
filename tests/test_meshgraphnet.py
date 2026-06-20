@@ -13,7 +13,7 @@ from models.meshgraphnet import (
 )
 
 
-def _random_graph(num_nodes=120, num_undirected=300, node_dim=16, edge_dim=3):
+def _random_graph(num_nodes=120, num_undirected=300, node_dim=12, edge_dim=3):
     e = torch.randint(0, num_nodes, (2, num_undirected))
     e = e[:, e[0] != e[1]]
     edge_index = torch.cat([e, e.flip(0)], dim=1)
@@ -23,7 +23,7 @@ def _random_graph(num_nodes=120, num_undirected=300, node_dim=16, edge_dim=3):
 
 
 def test_forward_output_shape():
-    cfg = MeshGraphNetConfig(node_in_dim=16, edge_in_dim=3, out_dim=1,
+    cfg = MeshGraphNetConfig(node_in_dim=12, edge_in_dim=3, out_dim=1,
                              hidden_dim=32, num_processing_steps=4)
     x, ei, ea = _random_graph()
     out = MeshGraphNet(cfg)(x, ei, ea)
@@ -99,7 +99,7 @@ def test_invalid_activation_raises():
 from models.meshgraphnet import energy_conserving_projection  # noqa: E402
 
 
-def _two_graph_batch(n1=40, n2=55, node_dim=16, edge_dim=3):
+def _two_graph_batch(n1=40, n2=55, node_dim=12, edge_dim=3):
     """Two disjoint random graphs concatenated into one PyG-style batch."""
     x1, e1, a1 = _random_graph(n1, 120, node_dim, edge_dim)
     x2, e2, a2 = _random_graph(n2, 150, node_dim, edge_dim)
