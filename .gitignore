@@ -60,7 +60,8 @@ logs/
 data/output/
 *.mp4
 
-# Exception: commit the training dataset (.npz only) so RunPod can `git clone`
-# code + data in one shot. Viz artifacts (.h5/.xdmf) and processed/ stay ignored.
-!data/raw/
-!data/raw/*.npz
+# Training dataset (.npz) is NOT committed: the v2 corpus is ~6.8 GB (too large
+# for git/GitHub) and is fully reproducible from the seeded generator. Regenerate
+# with:
+#   uv run python -m src.simulation.generate_dataset --num_train 300 --num_val 60 --workers 11
+# (data/raw/ and *.npz are already ignored above.)
