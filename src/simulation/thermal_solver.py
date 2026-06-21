@@ -71,20 +71,34 @@ class MaterialProperties:
     T_liquidus: float = 1773.0   # liquidus temperature [K]
     T_ambient: float = 300.0     # initial / ambient temperature [K]
     thickness: float = 5.0e-3    # plate thickness h [m]
+    # Vaporization: a second (much larger) latent-heat sink near the boiling
+    # point caps the peak temperature at a physical value. Without it, a strong
+    # source superheats the near-pool nodes to unphysical 1e4 K; in reality the
+    # excess energy vaporizes material instead, plateauing T near boiling.
+    latent_heat_vap: float = 6.3e6   # latent heat of vaporization [J/kg] (steel)
+    T_vaporization: float = 3134.0   # boiling point [K] (steel)
+    vap_width: float = 120.0         # smoothing width of the vaporization bump [K]
 
     def cp_apparent(self, T: np.ndarray) -> np.ndarray:
-        """Apparent heat capacity ``cp + L * d(f_liquid)/dT``.
+        """Apparent heat capacity ``cp + L_fus·d(f_liq)/dT + L_vap·d(f_vap)/dT``.
 
-        The liquid-fraction derivative is modelled as a normalized Gaussian
-        bump centred on the melting range so that its integral over temperature
-        equals one (total latent heat ``L`` is released across the interval).
-        Smooth and differentiable, which keeps the Picard iteration stable.
+        Each phase change is modelled as a normalized Gaussian bump (integral =
+        1) so its total latent heat is released across a smooth, differentiable
+        interval (keeps the Picard iteration stable). The melting bump sits on
+        the solidus-liquidus range; the much larger vaporization bump near the
+        boiling point acts as a thermostat that caps the dynamic range — energy
+        driving T toward boiling is absorbed by the phase change instead of
+        producing unphysical superheating.
         """
         Tm = 0.5 * (self.T_solidus + self.T_liquidus)
         width = max(self.T_liquidus - self.T_solidus, 1.0)
         s = width / 4.0
         dfl_dT = np.exp(-(((T - Tm) / s) ** 2)) / (s * np.sqrt(np.pi))
-        return self.cp + self.latent_heat * dfl_dT
+
+        s_v = max(self.vap_width, 1.0) / 4.0
+        dfv_dT = np.exp(-(((T - self.T_vaporization) / s_v) ** 2)) / (s_v * np.sqrt(np.pi))
+
+        return self.cp + self.latent_heat * dfl_dT + self.latent_heat_vap * dfv_dT
 
 
 @dataclass
@@ -152,6 +166,15 @@ class SolverConfig:
     #: its position at ``source_end_time``. ``None`` keeps the source on for the
     #: whole horizon (the original behaviour).
     source_end_time: Optional[float] = None
+    #: Adaptive cooling: when True (and ``source_end_time`` is set), the post-weld
+    #: phase runs until the peak temperature excess over ambient falls below
+    #: ``cool_rel_threshold`` of the peak reached during welding (near-field fully
+    #: relaxed), or ``t_cool_max`` seconds elapse — whichever comes first. This
+    #: replaces a fixed cooling-tail length and adapts to plate size. ``t_end``
+    #: is ignored for the cooling phase in this mode.
+    cool_to_relaxed: bool = False
+    cool_rel_threshold: float = 0.07
+    t_cool_max: float = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -634,9 +657,19 @@ class TransientThermalSolver:
         return T_iter
 
     def run(self) -> SimulationResult:
-        """Integrate over the time horizon and return collected snapshots."""
-        n_steps = int(round(self.cfg.t_end / self.cfg.dt))
+        """Integrate over the time horizon and return collected snapshots.
+
+        Two stopping modes (see :class:`SolverConfig`):
+
+        * **fixed** (default) — integrate exactly ``round(t_end / dt)`` steps.
+        * **adaptive cooling** (``cool_to_relaxed``) — weld until
+          ``source_end_time``, then continue with the source off until the peak
+          excess over ambient drops below ``cool_rel_threshold`` of the welding
+          peak, or ``t_cool_max`` seconds elapse.
+        """
+        dt = self.cfg.dt
         T = np.full(self.N, self.mat.T_ambient)
+        T_amb = self.mat.T_ambient
 
         times, temps = [], []
         src_pos, src_tan, src_nor, src_pow = [], [], [], []
@@ -652,21 +685,50 @@ class TransientThermalSolver:
 
         record(0.0, T)
 
-        iterator = range(1, n_steps + 1)
+        end = self.cfg.source_end_time
+        cool_mode = self.cfg.cool_to_relaxed and end is not None
+        n_fixed = int(round(self.cfg.t_end / dt))
+        # Safety bound on total steps even in adaptive mode (weld + capped cool).
+        n_max = (int(round((end + self.cfg.t_cool_max) / dt)) + 1) if cool_mode else n_fixed
+
+        progress = None
         if self.cfg.verbose:
             try:
                 from tqdm import tqdm
 
-                iterator = tqdm(iterator, desc="thermal solve", unit="step")
+                progress = tqdm(total=n_max, desc="thermal solve", unit="step")
             except ImportError:
                 pass
 
-        for n in iterator:
-            t_n = (n - 1) * self.cfg.dt
-            t_np1 = n * self.cfg.dt
+        peak_excess = 0.0
+        n = 0
+        while n < n_max:
+            n += 1
+            t_n = (n - 1) * dt
+            t_np1 = n * dt
             T = self._step(T, t_np1, t_n)
-            if n % self.cfg.snapshot_every == 0 or n == n_steps:
+
+            excess = float((T - T_amb).max())
+            if self._source_is_on(t_np1):
+                peak_excess = max(peak_excess, excess)
+
+            # Decide whether this is the final step BEFORE recording, so the last
+            # snapshot is always captured regardless of snapshot_every.
+            last = n >= n_max
+            if cool_mode and t_np1 >= end:
+                relaxed = excess < self.cfg.cool_rel_threshold * max(peak_excess, 1e-9)
+                if relaxed or (t_np1 - end) >= self.cfg.t_cool_max:
+                    last = True
+
+            if n % self.cfg.snapshot_every == 0 or last:
                 record(t_np1, T)
+            if progress is not None:
+                progress.update(1)
+            if last:
+                break
+
+        if progress is not None:
+            progress.close()
 
         return SimulationResult(
             coords=self.coords,

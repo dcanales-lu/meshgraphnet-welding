@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from models.meshgraphnet import (
+    FullGenericThermalHead,
     GraphNetBlock,
     MeshGraphNet,
     MeshGraphNetConfig,
@@ -150,3 +151,125 @@ def test_generic_disabled_has_zero_overhead():
 def test_generic_requires_scalar_output():
     with pytest.raises(ValueError):
         MeshGraphNet(MeshGraphNetConfig(out_dim=2, use_generic=True))
+
+
+def _realistic_stats(f=12):
+    """z-score constants with a melt-pool-scale q_goldak std (~1e9)."""
+    x_mean = torch.zeros(f)
+    x_std = torch.ones(f)
+    x_std[0] = 300.0       # temperature std [K]
+    x_std[1] = 1.0e9       # q_goldak std (huge physical source)
+    x_std[11] = 10.0       # T_inf std [K]
+    mask = torch.ones(f, dtype=torch.bool)
+    mask[[6, 7, 8]] = False  # BC one-hot columns are not normalized
+    return {
+        "x_mean": x_mean, "x_std": x_std,
+        "y_mean": torch.tensor(0.0), "y_std": torch.tensor(30.0),
+        "normalize_mask": mask,
+    }
+
+
+def test_generic_physical_head_scale_stable_and_conserving():
+    """After set_normalization the head runs in physical units without blow-up."""
+    torch.manual_seed(0)
+    model = MeshGraphNet(MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                                            use_generic=True))
+    model.set_normalization(_realistic_stats())
+
+    # softplus(gain) must absorb dt/(rho Cp) ~ y_std / q_std (~3e-8), not ~softplus(0).
+    sp_src = torch.nn.functional.softplus(model.generic_head.source_gain).item()
+    assert abs(sp_src - 30.0 / 1.0e9) < 1e-8
+
+    x, ei, ea, batch = _two_graph_batch()          # normalized-scale inputs O(1)
+    out = model(x, ei, ea, batch=batch)
+    assert torch.all(torch.isfinite(out))
+    assert out.abs().max() < 1e3                    # no 1e9 explosion
+
+    # Dissipative part conserves PHYSICAL energy per graph (Σ ≈ 0).
+    diss = model.generic_head.last_dissipative
+    for g in batch.unique():
+        assert diss[batch == g].sum().abs() < 1e-2
+
+
+def test_generic_set_normalization_preserves_trained_gains():
+    """A second set_normalization refreshes buffers but must not re-init gains."""
+    model = MeshGraphNet(MeshGraphNetConfig(hidden_dim=8, num_processing_steps=1,
+                                            use_generic=True))
+    model.set_normalization(_realistic_stats())
+    with torch.no_grad():
+        model.generic_head.source_gain.add_(1.234)   # pretend training moved it
+    g = model.generic_head.source_gain.clone()
+    model.set_normalization(_realistic_stats())       # refresh
+    assert torch.allclose(model.generic_head.source_gain, g)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_generic_cuda_parity():
+    """No device mismatch: cpu and cuda give matching output."""
+    torch.manual_seed(0)
+    model = MeshGraphNet(MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                                            use_generic=True))
+    model.set_normalization(_realistic_stats())
+    x, ei, ea, batch = _two_graph_batch()
+    out_cpu = model(x, ei, ea, batch=batch)
+    m = model.cuda()
+    out_cuda = m(x.cuda(), ei.cuda(), ea.cuda(), batch=batch.cuda()).cpu()
+    assert torch.allclose(out_cpu, out_cuda, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Full (second-law) GENERIC head
+# ---------------------------------------------------------------------------
+def _chain_graph(temps_phys, hidden=16, t_std=300.0):
+    """A bidirectional chain over nodes with the given physical temperatures.
+
+    x_raw is all zeros except the (normalized) temperature column 0, so the
+    external source/cooling terms vanish and we can probe the dissipative part.
+    """
+    n = len(temps_phys)
+    f = 12
+    x = torch.zeros(n, f)
+    x[:, 0] = torch.tensor(temps_phys) / t_std        # normalized T (x_mean=0)
+    und = torch.tensor([[i, i + 1] for i in range(n - 1)], dtype=torch.long).t()
+    edge_index = torch.cat([und, und.flip(0)], dim=1)  # bidirectional
+    h = torch.randn(n, hidden)
+    return x, edge_index, h
+
+
+def test_full_generic_builds_and_bypasses_decoder():
+    cfg = MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                             use_generic=True, generic_mode="full")
+    model = MeshGraphNet(cfg)
+    assert model.decoder is None                       # decoder omitted in full mode
+    assert isinstance(model.generic_head, FullGenericThermalHead)
+    assert model.generic_head.uses_node_latents is True
+    # More than +2 params (cond MLP + scale), vs energy head's +2.
+    base = MeshGraphNet(MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2))
+    assert model.num_parameters() > base.num_parameters() + 2
+
+    model.set_normalization(_realistic_stats())
+    x, ei, ea, batch = _two_graph_batch()
+    out = model(x, ei, ea, batch=batch)
+    assert out.shape == (x.size(0), 1) and torch.all(torch.isfinite(out))
+
+
+def test_full_generic_structure_preserving():
+    """SPSD Laplacian dissipation: energy conserved, entropy produced, hot→cold."""
+    torch.manual_seed(0)
+    cfg = MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                             use_generic=True, generic_mode="full")
+    head = FullGenericThermalHead(cfg)
+    head.set_normalization(_realistic_stats())
+
+    temps = [2000.0, 500.0, 400.0, 350.0, 300.0]       # node 0 hot, rest cooler
+    x, edge_index, h = _chain_graph(temps)
+    head(None, x, batch=None, node_latents=h, edge_index=edge_index)
+    diss = head.last_dissipative                        # = L_w μ  (N,1)
+
+    # 1) Degeneracy M·∇E = 0  -> energy conserved: Σ_i dT_diss_i ≈ 0.
+    assert diss.sum().abs() < 1e-3 * diss.abs().sum().clamp_min(1e-9)
+    # 2) Entropy production dS/dt = μᵀ L_w μ ≥ 0  (μ = 1/T).
+    mu = 1.0 / torch.tensor(temps).clamp_min(head.T_FLOOR).reshape(-1, 1)
+    assert (mu * diss).sum().item() >= -1e-4
+    # 3) Heat flows hot→cold: the hottest node's dissipative increment cools it.
+    assert diss[0, 0].item() < 0.0

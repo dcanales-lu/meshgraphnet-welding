@@ -83,29 +83,53 @@ def test_sampled_trajectory_stays_inside_material(kind):
 
 
 def test_build_simulation_returns_solver_and_provenance():
-    solver, prov = build_simulation(np.random.default_rng(7), h_el=H_EL, target_steps=20)
+    solver, prov = build_simulation(np.random.default_rng(7), h_el=H_EL, t_cool_max=2.0)
     assert isinstance(solver, TransientThermalSolver)
     assert prov["geometry"]["kind"] in GEOMETRY_KINDS
     assert prov["trajectory"]["kind"] in {"straight", "diagonal", "sinusoid", "arc"}
     assert 0.01 <= prov["trajectory"]["dt"] <= 0.05
     assert prov["boundary"]["h_conv"] > 0.0
+    assert solver.cfg.cool_to_relaxed is True
 
 
 def test_build_simulation_is_reproducible():
     """Same seed -> identical sampled spec (provenance)."""
-    _, a = build_simulation(np.random.default_rng(11), h_el=H_EL, target_steps=20)
-    _, b = build_simulation(np.random.default_rng(11), h_el=H_EL, target_steps=20)
+    _, a = build_simulation(np.random.default_rng(11), h_el=H_EL, t_cool_max=2.0)
+    _, b = build_simulation(np.random.default_rng(11), h_el=H_EL, t_cool_max=2.0)
     assert a == b
 
 
-def test_end_to_end_npz_consumable_by_graph_pipeline(tmp_path):
-    """`main` writes named .npz files that build valid (N,16) graphs."""
+def test_build_simulation_bc_stratification():
+    """Forced strata populate radiation / Dirichlet deterministically."""
+    _, prov = build_simulation(
+        np.random.default_rng(3), h_el=H_EL, t_cool_max=2.0,
+        bc_strata={"radiation": True, "dirichlet": True},
+    )
+    assert prov["boundary"]["emissivity"] > 0.0
+    assert prov["boundary"]["dirichlet_edge"] is not None
+    _, prov2 = build_simulation(
+        np.random.default_rng(3), h_el=H_EL, t_cool_max=2.0,
+        bc_strata={"radiation": False, "dirichlet": False},
+    )
+    assert prov2["boundary"]["emissivity"] == 0.0
+    assert prov2["boundary"]["dirichlet_edge"] is None
+
+
+def test_end_to_end_npz_consumable_by_graph_pipeline(tmp_path, monkeypatch):
+    """`main` writes named .npz files that build valid (N,12) graphs."""
+    # Shrink the sampling ranges so this plumbing test stays fast (the real
+    # corpus uses large plates / long welds; here we only exercise the pipeline).
+    import simulation.generate_dataset as gd
+    monkeypatch.setattr(gd, "WIDTH_RANGE", (0.040, 0.050))
+    monkeypatch.setattr(gd, "HEIGHT_RANGE", (0.040, 0.050))
+    monkeypatch.setattr(gd, "SPEED_RANGE", (8.0e-3, 10.0e-3))
     main(
         [
             "--num_train", "1",
             "--num_val", "1",
             "--element_size", "7e-3",
-            "--target_steps", "8",
+            "--t_cool_max", "1.0",
+            "--workers", "1",
             "--data_root", str(tmp_path),
         ]
     )

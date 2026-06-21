@@ -46,7 +46,9 @@ See ``--help`` for resolution / time-stepping / reproducibility knobs.
 from __future__ import annotations
 
 import argparse
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -72,9 +74,9 @@ from simulation.thermal_solver import (
 #: Gross arc power [W]; net power deposited is ``efficiency * power``.
 POWER_RANGE = (1500.0, 3500.0)
 EFFICIENCY_RANGE = (0.70, 0.90)
-#: Travel speed [m/s] (2-8 mm/s). The slower floor lengthens the weld phase so
-#: rollouts cover more autoregressive steps before the cooling tail begins.
-SPEED_RANGE = (2.0e-3, 8.0e-3)
+#: Travel speed [m/s] (2-12 mm/s). Brackets the spiral inference speed (10 mm/s)
+#: so the validation regime is interior to the training distribution.
+SPEED_RANGE = (2.0e-3, 12.0e-3)
 
 #: Goldak ellipsoid semi-axes [m].
 B_RANGE = (2.0e-3, 3.5e-3)        # transverse half-width (along normal)
@@ -92,9 +94,11 @@ EMISSIVITY_CHOICES = (0.0, 0.0, 0.0, 0.2, 0.35)
 #: Probability that one outer edge is held at a fixed (Dirichlet) temperature.
 DIRICHLET_PROB = 0.30
 
-#: Plate bounding-box dimensions [m].
-WIDTH_RANGE = (0.050, 0.085)
-HEIGHT_RANGE = (0.040, 0.065)
+#: Plate bounding-box dimensions [m]. Brackets the 0.2 m spiral inference plate
+#: so the validation domain size is interior to the training distribution (the
+#: spiral trajectory is the ONLY held-out generalization axis).
+WIDTH_RANGE = (0.080, 0.250)
+HEIGHT_RANGE = (0.080, 0.250)
 
 #: Geometry mix (weights must sum to 1).
 GEOMETRY_KINDS = ("rect", "lshape", "hole")
@@ -364,15 +368,29 @@ def _u(rng: np.random.Generator, lo: float, hi: float) -> float:
 
 
 def build_boundary_conditions(
-    geom: Geometry, rng: np.random.Generator, t_ambient: float
+    geom: Geometry,
+    rng: np.random.Generator,
+    t_ambient: float,
+    force_radiation: Optional[bool] = None,
+    force_dirichlet: Optional[bool] = None,
 ) -> Tuple[dict, float, float, Optional[str]]:
     """Robin convection on every boundary; optionally one Dirichlet outer edge.
 
     A single randomized ``(h_conv, T_inf, emissivity)`` triple is shared across
     markers so the network sees a coherent Robin response per simulation.
+
+    ``force_radiation`` / ``force_dirichlet`` allow **stratified** BC sampling so
+    each combination (radiation on/off × Dirichlet present/absent) is guaranteed
+    coverage across the corpus rather than left to chance: ``True`` forces the
+    feature on, ``False`` off, ``None`` keeps the original random behaviour.
     """
     h_conv = _u(rng, *H_CONV_RANGE)
-    emissivity = float(rng.choice(EMISSIVITY_CHOICES))
+    if force_radiation is None:
+        emissivity = float(rng.choice(EMISSIVITY_CHOICES))
+    elif force_radiation:
+        emissivity = float(rng.choice([e for e in EMISSIVITY_CHOICES if e > 0]))
+    else:
+        emissivity = 0.0
     robin = Robin(h_conv=h_conv, T_inf=t_ambient, emissivity=emissivity)
 
     markers = ["left", "right", "bottom", "top"]
@@ -380,8 +398,10 @@ def build_boundary_conditions(
         markers.append("inner")
     bcs: dict = {m: robin for m in markers}
 
+    add_dirichlet = (rng.random() < DIRICHLET_PROB) if force_dirichlet is None \
+        else bool(force_dirichlet)
     dirichlet_edge = None
-    if rng.random() < DIRICHLET_PROB:
+    if add_dirichlet:
         dirichlet_edge = str(rng.choice(["left", "right", "bottom", "top"]))
         bcs[dirichlet_edge] = Dirichlet(value=t_ambient)
     return bcs, h_conv, emissivity, dirichlet_edge
@@ -390,17 +410,19 @@ def build_boundary_conditions(
 def build_simulation(
     rng: np.random.Generator,
     h_el: float,
-    target_steps: int,
-    min_cooling_steps: int = 60,
+    t_cool_max: float = 30.0,
+    bc_strata: Optional[dict] = None,
 ) -> Tuple[TransientThermalSolver, dict]:
     """Sample one fully-specified simulation; return solver + provenance dict.
 
-    ``target_steps`` is the **total** snapshot budget (weld + cooling tail). The
-    time step is pinned near the spiral inference regime (~0.05 s); after the
-    weld finishes the heat source switches off and the simulation continues to
-    cool for at least ``min_cooling_steps`` steps, so the model is trained and
-    validated on long-horizon autoregressive rollouts.
+    The time step is pinned near the spiral inference regime (~0.05 s). After the
+    weld the source switches off and the simulation **cools adaptively** until the
+    near-field is fully relaxed (peak excess < 7% of the welding peak) or
+    ``t_cool_max`` seconds elapse — so every sim covers a complete local
+    relaxation regardless of plate size. ``bc_strata`` (optional
+    ``{"radiation": bool, "dirichlet": bool}``) forces stratified BC coverage.
     """
+    bc_strata = bc_strata or {}
     # Geometry.
     w = _u(rng, *WIDTH_RANGE)
     h = _u(rng, *HEIGHT_RANGE)
@@ -428,9 +450,11 @@ def build_simulation(
         thickness=_u(rng, *THICKNESS_RANGE), T_ambient=t_ambient
     )
 
-    # Boundary conditions.
+    # Boundary conditions (optionally stratified for guaranteed coverage).
     bcs, h_conv, emissivity, dirichlet_edge = build_boundary_conditions(
-        geom, rng, t_ambient
+        geom, rng, t_ambient,
+        force_radiation=bc_strata.get("radiation"),
+        force_dirichlet=bc_strata.get("dirichlet"),
     )
 
     # Trajectory + weld-phase duration.
@@ -440,13 +464,12 @@ def build_simulation(
     # the learned per-step ΔT transfers to long inference rollouts.
     dt = float(rng.uniform(0.045, 0.05))
 
-    # Post-weld cooling tail: extend the horizon to reach the total snapshot
-    # budget, with a guaranteed minimum cool-down even for already-long welds.
-    # The source switches OFF at ``t_weld`` (see SolverConfig.source_end_time).
-    t_cool = max(min_cooling_steps * dt, target_steps * dt - t_weld)
-    t_end = t_weld + t_cool
+    # Source off at t_weld, then ADAPTIVE cooling until the near-field is fully
+    # relaxed (or t_cool_max). t_end only bounds the weld phase here.
     cfg = SolverConfig(
-        dt=dt, t_end=t_end, source_end_time=t_weld, verbose=False
+        dt=dt, t_end=t_weld, source_end_time=t_weld,
+        cool_to_relaxed=True, cool_rel_threshold=0.07, t_cool_max=t_cool_max,
+        verbose=False,
     )
 
     solver = TransientThermalSolver(geom.mesh, material, goldak, traj, bcs, cfg)
@@ -465,9 +488,8 @@ def build_simulation(
             "speed": speed,
             "dt": dt,
             "t_weld": t_weld,
-            "t_cool": t_cool,
-            "t_end": t_end,
             "source_end_time": t_weld,
+            "t_cool_max": t_cool_max,
         },
         "boundary": {
             "h_conv": h_conv,
@@ -481,50 +503,87 @@ def build_simulation(
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+#: Stratified BC combinations (radiation on/off × Dirichlet present/absent),
+#: cycled across each split so every combination gets guaranteed coverage.
+_BC_STRATA = [
+    {"radiation": False, "dirichlet": False},
+    {"radiation": True, "dirichlet": False},
+    {"radiation": False, "dirichlet": True},
+    {"radiation": True, "dirichlet": True},
+]
+
+
+def _generate_one(task: dict) -> dict:
+    """Build, solve and save one simulation. Top-level so it is picklable for
+    :class:`ProcessPoolExecutor` (FEM sims are independent → embarrassingly
+    parallel across CPU cores)."""
+    split, i, seed = task["split"], task["i"], task["seed"]
+    rng = np.random.default_rng(seed)
+    solver, provenance = build_simulation(
+        rng, task["h_el"], t_cool_max=task["t_cool_max"], bc_strata=task["bc_strata"]
+    )
+    result = solver.run()
+    result.metadata["generation"] = {"split": split, "seed": seed, **provenance}
+
+    stem = f"sim_{split}_{i + 1:03d}"
+    path = result.save_npz(Path(task["out_dir"]) / stem)
+    if task["save_xdmf"]:
+        result.save_xdmf(Path(task["out_dir"]) / stem)
+    return {
+        "path": str(path),
+        "geom": provenance["geometry"]["kind"],
+        "nodes": provenance["geometry"]["num_nodes"],
+        "snaps": int(result.times.shape[0]),
+        "peakT": float(result.temperature.max()),
+    }
+
+
 def generate_split(
     split: str,
     count: int,
     out_dir: Path,
     base_seed: int,
     h_el: float,
-    target_steps: int,
-    min_cooling_steps: int,
+    t_cool_max: float,
     save_xdmf: bool,
-) -> List[Path]:
-    """Generate ``count`` simulations for one split, with a clean tqdm bar."""
+    workers: int,
+) -> List[dict]:
+    """Generate ``count`` simulations for one split, in parallel across cores."""
+    offset = (1 if split == "train" else 2) * 100_000
+    tasks = [
+        {
+            "split": split, "i": i, "seed": base_seed + offset + i,
+            "h_el": h_el, "t_cool_max": t_cool_max,
+            "bc_strata": _BC_STRATA[i % len(_BC_STRATA)],
+            "out_dir": str(out_dir), "save_xdmf": save_xdmf,
+        }
+        for i in range(count)
+    ]
+
+    bar = None
     try:
         from tqdm import tqdm
 
-        bar = tqdm(range(count), desc=f"{split:5s}", unit="sim")
+        bar = tqdm(total=count, desc=f"{split:5s}", unit="sim")
     except ImportError:  # pragma: no cover - tqdm is a declared dependency
-        bar = range(count)
+        pass
 
-    written: List[Path] = []
-    for i in bar:
-        # Per-sim seed keeps the corpus reproducible *and* resumable per index.
-        offset = (1 if split == "train" else 2) * 100_000
-        seed = base_seed + offset + i
-        rng = np.random.default_rng(seed)
-        solver, provenance = build_simulation(
-            rng, h_el, target_steps, min_cooling_steps
-        )
-        result = solver.run()
-        result.metadata["generation"] = {"split": split, "seed": seed, **provenance}
+    def _note(res: dict) -> None:
+        if bar is not None:
+            bar.update(1)
+            bar.set_postfix(geom=res["geom"], nodes=res["nodes"],
+                            snaps=res["snaps"], peakT=f"{res['peakT']:.0f}")
 
-        stem = f"sim_{split}_{i + 1:03d}"
-        path = result.save_npz(out_dir / stem)
-        if save_xdmf:
-            result.save_xdmf(out_dir / stem)
-        written.append(path)
-
-        if hasattr(bar, "set_postfix"):
-            g = provenance["geometry"]
-            bar.set_postfix(
-                geom=g["kind"],
-                path=provenance["trajectory"]["kind"],
-                nodes=g["num_nodes"],
-                snaps=int(result.times.shape[0]),
-            )
+    written: List[dict] = []
+    if workers <= 1:
+        for t in tasks:
+            res = _generate_one(t); written.append(res); _note(res)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for res in ex.map(_generate_one, tasks):
+                written.append(res); _note(res)
+    if bar is not None:
+        bar.close()
     return written
 
 
@@ -546,22 +605,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--element_size",
         type=float,
-        default=2.5e-3,
-        help="target mesh element edge length [m] (smaller = finer/slower)",
+        default=3.0e-3,
+        help="target mesh element edge length [m] (matches the spiral inference "
+        "mesh; smaller = finer/slower)",
     )
     p.add_argument(
-        "--target_steps",
-        type=int,
-        default=300,
-        help="total snapshot budget per simulation (weld + cooling tail) at the "
-        "fixed ~0.05 s spiral-regime dt",
+        "--t_cool_max",
+        type=float,
+        default=30.0,
+        help="max post-weld cooling time [s]; the sim cools until the near-field "
+        "is relaxed (peak excess < 7%% of the welding peak) or this cap",
     )
     p.add_argument(
-        "--min_cooling_steps",
+        "--workers",
         type=int,
-        default=60,
-        help="minimum number of post-weld cooling steps (source off) even when "
-        "the weld phase already fills the target budget",
+        default=max(1, (os.cpu_count() or 2) - 1),
+        help="parallel FEM worker processes (sims are independent)",
     )
     p.add_argument(
         "--save_xdmf",
@@ -580,11 +639,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         f"Generating dataset -> {raw_dir.resolve()}\n"
         f"  train={args.num_train}  val={args.num_val}  "
         f"element_size={args.element_size * 1e3:.2f} mm  "
-        f"~steps={args.target_steps} (weld+cool, >={args.min_cooling_steps} cool)  "
-        f"seed={args.seed}"
+        f"cool<=({args.t_cool_max:.0f}s)  workers={args.workers}  seed={args.seed}"
     )
     t0 = time.perf_counter()
-    written: List[Path] = []
+    written: List[dict] = []
     for split, count in (("train", args.num_train), ("val", args.num_val)):
         if count <= 0:
             continue
@@ -594,9 +652,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             raw_dir,
             args.seed,
             args.element_size,
-            args.target_steps,
-            args.min_cooling_steps,
+            args.t_cool_max,
             args.save_xdmf,
+            args.workers,
         )
     elapsed = time.perf_counter() - t0
     print(

@@ -112,6 +112,7 @@ class TrainConfig:
     use_layer_norm: bool = True
     aggregation: str = "sum"
     use_generic: bool = False  # enable GENERIC structure-preserving thermal head
+    generic_mode: str = "energy"  # "energy" (degeneracy only) | "full" (+ second law)
 
     # simulation-level split
     val_fraction: float = 0.20
@@ -153,6 +154,7 @@ class TrainConfig:
             use_layer_norm=self.use_layer_norm,
             aggregation=self.aggregation,
             use_generic=self.use_generic,
+            generic_mode=self.generic_mode,
         )
 
     def data_config(self) -> TrainingConfig:
@@ -381,6 +383,10 @@ def train(cfg: TrainConfig) -> dict:
 
     # --- Model / optim ---
     model = MeshGraphNet(cfg.model_config()).to(device)
+    if cfg.use_generic:
+        # Give the GENERIC head its z-score constants so it runs in physical units.
+        model.set_normalization(stats)
+        log.info("GENERIC thermodynamic head enabled (physical-units).")
     log.info("MeshGraphNet on %s | %d params | %d processing steps",
              device, model.num_parameters(), cfg.num_processing_steps)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)

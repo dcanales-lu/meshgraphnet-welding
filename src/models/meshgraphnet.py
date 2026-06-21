@@ -22,6 +22,7 @@ The data contract from ``src/data/graph_builder.py`` is the intended input:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -84,6 +85,14 @@ class MeshGraphNetConfig:
 
     # --- Optional GENERIC structure-preserving thermodynamic head ---
     use_generic: bool = False
+    #: GENERIC dissipation operator:
+    #:   "energy" — degeneracy-only (energy-conserving projection of the decoder
+    #:              increment). Guarantees M·∇E = 0 but NOT entropy production.
+    #:   "full"   — second-law GENERIC: SPSD graph-Laplacian of learned
+    #:              conductances acting on the entropy gradient ∇S = 1/T.
+    #:              Guarantees M SPSD, M·∇E = 0, AND dS/dt ≥ 0 (hot→cold) by
+    #:              construction.
+    generic_mode: str = "energy"
     #: Feature-column indices the GENERIC head reads (graph_builder 12-d layout).
     temperature_index: int = 0
     goldak_index: int = 1
@@ -251,30 +260,22 @@ def energy_conserving_projection(
     return v - (num / den)[batch] * w
 
 
-class GenericThermalHead(nn.Module):
-    """Structure-preserving head for the pure-thermal dissipative GENERIC system.
+class _GenericHeadBase(nn.Module):
+    """Shared machinery for the GENERIC thermal heads.
 
-    The evolution ``T_dot = M(T) grad S(T) + Q_ext`` (the reversible part
-    ``L grad E`` vanishes for a pure thermal problem) is realised at the
-    increment level as ``dT = P . dT_tilde + q_ext``, where, using global
-    energy ``E = sum rho Cp T_i V_i`` and entropy
-    ``S = sum rho Cp ln(T_i) V_i``:
+    Holds the normalization buffers (so the head can operate in PHYSICAL kelvin
+    while the network is fed normalized features and emits normalized ΔT), the
+    analytical external exchange (Goldak source + Newton boundary cooling), and
+    the normalized↔physical conversions. Subclasses supply the *dissipative*
+    operator; the external term and the energy/entropy bookkeeping are common.
 
-    * ``P . dT_tilde`` projects the decoder's unconstrained increment onto
-      the complement of grad(E) (:func:`energy_conserving_projection`),
-      guaranteeing the degeneracy ``M grad E = 0`` -- the learned dissipative
-      redistribution conserves internal energy, removing the spurious global
-      heating/cooling drift behind unphysical temperature collapse.
-    * ``q_ext`` is the external energy exchange built from the analytical
-      physical features: a heating term following the Goldak source field and
-      a Newton boundary-cooling term relaxing Robin nodes toward ``T_inf``.
-      Each carries a learnable non-negative ``softplus`` magnitude that
-      absorbs the ``dt / rho Cp`` scale while preserving the physical sign
-      structure (sources add energy; boundary cooling removes it).
-
-    Uniform tributary volumes are used for grad(E) (``rho Cp V_i`` constant),
-    as permitted for simplicity.
+    Uniform tributary volumes are assumed (``ρ Cp V_i`` constant), so ``∇E`` is
+    the constant vector and energy is ``E = Σ ρCp T_i V_i``.
     """
+
+    #: Whether the head consumes the processor node latents (full GENERIC) rather
+    #: than the decoder increment (energy-only). Set by subclasses.
+    uses_node_latents: bool = False
 
     def __init__(self, cfg: MeshGraphNetConfig):
         super().__init__()
@@ -284,9 +285,84 @@ class GenericThermalHead(nn.Module):
         self.tinf_idx = cfg.t_inf_index
         self.source_gain = nn.Parameter(torch.zeros(1))
         self.cool_gain = nn.Parameter(torch.zeros(1))
+
+        # Normalization constants (populated by `set_normalization`). Buffers
+        # (not params) -> they ride in state_dict and move with `.to(device)`,
+        # but don't count as parameters.
+        f = cfg.node_in_dim
+        self.register_buffer("x_mean", torch.zeros(f))
+        self.register_buffer("x_std", torch.ones(f))
+        self.register_buffer("norm_mask", torch.ones(f, dtype=torch.bool))
+        self.register_buffer("y_mean", torch.zeros(1))
+        self.register_buffer("y_std", torch.ones(1))
+        self.register_buffer("_initialized", torch.zeros(1))
+
         # Most-recent components, cached (detached) for inspection / tests.
         self.last_dissipative: Optional[torch.Tensor] = None
         self.last_external: Optional[torch.Tensor] = None
+
+    def set_normalization(self, stats: dict) -> None:
+        """Load z-score constants so the head can de/re-normalize internally.
+
+        Call once on a fresh model before training. On the first call it also
+        initializes the source/cooling gains so ``softplus(gain)·feature_scale``
+        starts at the physical ΔT scale (``q_goldak`` is ~1e10, so a zero gain
+        would blow up). Subsequent calls only refresh the buffers and leave
+        trained gains untouched (``_initialized`` rides in state_dict).
+        """
+        self.x_mean.copy_(stats["x_mean"].reshape(-1).to(self.x_mean))
+        self.x_std.copy_(stats["x_std"].reshape(-1).clamp_min(1e-8).to(self.x_std))
+        self.norm_mask.copy_(stats["normalize_mask"].reshape(-1).bool().to(self.norm_mask.device))
+        self.y_mean.copy_(stats["y_mean"].reshape(1).to(self.y_mean))
+        self.y_std.copy_(stats["y_std"].reshape(1).clamp_min(1e-8).to(self.y_std))
+        if float(self._initialized) < 0.5:
+            with torch.no_grad():
+                # softplus(gain) ~ ΔT_scale / driver_scale  (absorbs dt/(rho Cp)).
+                tgt_src = (self.y_std / self.x_std[self.q_idx]).clamp_min(1e-12)
+                tgt_cool = (self.y_std / self.x_std[self.t_idx]).clamp_min(1e-12)
+                self.source_gain.copy_(torch.log(torch.expm1(tgt_src)))
+                self.cool_gain.copy_(torch.log(torch.expm1(tgt_cool)))
+            self._initialized.fill_(1.0)
+
+    def _phys_col(self, x_raw: torch.Tensor, idx: int) -> torch.Tensor:
+        """De-normalize column ``idx`` to physical units (raw if un-normalized)."""
+        c = x_raw[:, idx:idx + 1]
+        if bool(self.norm_mask[idx]):
+            c = c * self.x_std[idx] + self.x_mean[idx]
+        return c
+
+    def _external(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """Analytical external energy exchange (physical units).
+
+        Goldak heating (sign-positive) + Newton boundary cooling toward
+        ``T_inf`` on Robin nodes. Each gain is non-negative (``softplus``) so the
+        physical sign structure is preserved: sources add energy, cooling removes
+        it as ``T`` exceeds ``T_inf``.
+        """
+        q = self._phys_col(x_raw, self.q_idx)
+        t = self._phys_col(x_raw, self.t_idx)
+        t_inf = self._phys_col(x_raw, self.tinf_idx)
+        robin = self._phys_col(x_raw, self.robin_idx)          # one-hot, used raw
+        return F.softplus(self.source_gain) * q + \
+            F.softplus(self.cool_gain) * robin * (t_inf - t)
+
+    def _to_normalized_increment(self, dT_phys: torch.Tensor) -> torch.Tensor:
+        """Physical ΔT -> normalized units (the model's output contract)."""
+        return (dT_phys - self.y_mean) / self.y_std
+
+
+class GenericThermalHead(_GenericHeadBase):
+    """Energy-only (degeneracy) GENERIC head: ``dT = P·dT_tilde + q_ext``.
+
+    The dissipative part projects the decoder's unconstrained physical increment
+    onto the complement of ``∇E`` (:func:`energy_conserving_projection`),
+    guaranteeing the degeneracy ``M·∇E = 0`` — the learned redistribution
+    conserves internal energy per graph, removing spurious global heating/cooling
+    drift. It does NOT enforce entropy production (no SPSD operator); for that,
+    use :class:`FullGenericThermalHead`.
+    """
+
+    uses_node_latents = False
 
     def forward(
         self,
@@ -294,21 +370,106 @@ class GenericThermalHead(nn.Module):
         x_raw: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Energy-conserving dissipative redistribution (M grad E = 0 by design).
-        dissipative = energy_conserving_projection(delta_t_tilde, batch=batch)
-
-        # Analytical external exchange from physical node features.
-        source = F.softplus(self.source_gain) * x_raw[:, self.q_idx:self.q_idx + 1]
-        robin = x_raw[:, self.robin_idx:self.robin_idx + 1]
-        cooling = F.softplus(self.cool_gain) * robin * (
-            x_raw[:, self.tinf_idx:self.tinf_idx + 1]
-            - x_raw[:, self.t_idx:self.t_idx + 1]
-        )
-        external = source + cooling
+        # De-normalize the decoder increment to physical kelvin, project to
+        # conserve energy, add the analytical external exchange, re-normalize.
+        dT_tilde = delta_t_tilde * self.y_std + self.y_mean
+        dissipative = energy_conserving_projection(dT_tilde, batch=batch)
+        external = self._external(x_raw)
 
         self.last_dissipative = dissipative.detach()
         self.last_external = external.detach()
-        return dissipative + external
+        return self._to_normalized_increment(dissipative + external)
+
+
+class FullGenericThermalHead(_GenericHeadBase):
+    """Full (second-law) GENERIC head: SPSD graph-Laplacian dissipation.
+
+    The dissipative increment is ``dT_diss = L_w · μ`` where ``μ_i = ∂S/∂e_i =
+    1/T_i`` is the entropy gradient and ``L_w = D − W`` is the graph Laplacian of
+    **learned non-negative, symmetric** edge conductances
+    ``w_ij = exp(scale)·softplus(MLP(symmetric features)) ≥ 0``. By construction
+    this guarantees the full GENERIC dissipative structure:
+
+    * **SPSD operator** — ``w ≥ 0`` and symmetric ⇒ ``L_w`` is positive
+      semi-definite.
+    * **Degeneracy ``M·∇E = 0``** — the Laplacian has zero column sums, so
+      ``Σ_i dT_diss_i = 0`` per graph (internal energy conserved exactly).
+    * **Entropy production ``dS/dt = μᵀ L_w μ = ½ Σ_ij w_ij (μ_i−μ_j)² ≥ 0``** —
+      the second law, absent from the energy-only head.
+    * **Heat flows hot → cold** — a hot node (small ``μ``) next to cold neighbors
+      (large ``μ``) gets ``dT_diss < 0``.
+
+    Symmetry ``w_ij = w_ji`` is obtained for free by feeding the conductance MLP
+    only **symmetric** edge features (``h_i+h_j``, ``(h_i−h_j)²``, ``T_i+T_j``,
+    ``|T_i−T_j|``); the bidirectional edge set then realizes both Laplacian rows.
+    ``μ`` uses ``T`` clamped to a physical floor so it stays bounded even if a
+    rollout briefly drives a node toward 0 K. The decoder is bypassed entirely
+    in this mode (the dissipation comes from the conductances, not a free
+    per-node increment, which would violate the degeneracy). The same analytical
+    external exchange (Goldak source + Newton cooling) is added.
+    """
+
+    uses_node_latents = True
+
+    #: Temperature floor [K] for the entropy gradient μ = 1/T (keeps μ bounded).
+    T_FLOOR: float = 200.0
+
+    def __init__(self, cfg: MeshGraphNetConfig):
+        super().__init__(cfg)
+        act = cfg.activation_factory()
+        h = cfg.hidden_dim
+        # Conductance MLP input: [h_i+h_j, (h_i-h_j)^2, T_sum, |T_diff|] (all
+        # symmetric under i<->j) -> a single non-negative scalar per edge.
+        self.cond_mlp = build_mlp(
+            2 * h + 2, h, 1, cfg.num_mlp_layers, act, layer_norm=False
+        )
+        # Global conductance scale (absorbs the awkward 1/T² magnitude of working
+        # in μ=1/T space). Init ~500 so dT_diss starts at O(1 K) for strong
+        # gradients (validated by the smoke test); training tunes it.
+        self.log_cond_scale = nn.Parameter(torch.tensor([math.log(500.0)]))
+
+    def forward(
+        self,
+        delta_t_tilde: Optional[torch.Tensor],
+        x_raw: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+        node_latents: Optional[torch.Tensor] = None,
+        edge_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if node_latents is None or edge_index is None:
+            raise ValueError(
+                "FullGenericThermalHead requires node_latents and edge_index."
+            )
+        h = node_latents
+        src, dst = edge_index[0], edge_index[1]
+
+        t = self._phys_col(x_raw, self.t_idx)                  # (N,1) physical T
+        tscale = self.x_std[self.t_idx].clamp_min(1e-6)
+
+        # Symmetric per-edge conductance features -> w_ij = w_ji by construction.
+        hi, hj = h[src], h[dst]
+        t_src, t_dst = t[src], t[dst]
+        feats = torch.cat([
+            hi + hj,
+            (hi - hj) ** 2,
+            (t_src + t_dst) / (2.0 * tscale),
+            (t_src - t_dst).abs() / tscale,
+        ], dim=-1)
+        w = torch.exp(self.log_cond_scale) * F.softplus(self.cond_mlp(feats))  # (E,1) ≥ 0
+
+        # Entropy gradient μ = ∂S/∂e = 1/T (clamped for a bounded, finite μ).
+        mu = 1.0 / t.clamp_min(self.T_FLOOR)                   # (N,1)
+
+        # dT_diss = (L_w μ): for directed edge (s->r) add w·(μ_r − μ_s) to r.
+        # Summed over bidirectional edges this is exactly the SPSD Laplacian
+        # action; its per-graph sum is 0 (energy conserved).
+        edge_term = w * (mu[dst] - mu[src])
+        dissipative = scatter(edge_term, dst, dim=0, dim_size=h.size(0), reduce="sum")
+
+        external = self._external(x_raw)
+        self.last_dissipative = dissipative.detach()
+        self.last_external = external.detach()
+        return self._to_normalized_increment(dissipative + external)
 
 
 # ---------------------------------------------------------------------------
@@ -331,13 +492,21 @@ class MeshGraphNet(nn.Module):
         self.processor = nn.ModuleList(
             GraphNetBlock(cfg) for _ in range(cfg.num_processing_steps)
         )
-        self.decoder = Decoder(cfg)
         if cfg.use_generic and cfg.out_dim != 1:
             raise ValueError(
                 "use_generic=True requires out_dim == 1 (scalar temperature state)."
             )
+        full_generic = cfg.use_generic and cfg.generic_mode == "full"
+        # The full GENERIC head derives the increment from learned conductances,
+        # not the decoder, so the decoder is omitted entirely in that mode.
+        self.decoder = None if full_generic else Decoder(cfg)
         # Instantiated only when enabled -> exactly zero overhead when disabled.
-        self.generic_head = GenericThermalHead(cfg) if cfg.use_generic else None
+        if not cfg.use_generic:
+            self.generic_head = None
+        elif full_generic:
+            self.generic_head = FullGenericThermalHead(cfg)
+        else:
+            self.generic_head = GenericThermalHead(cfg)
 
     def forward(
         self,
@@ -376,14 +545,30 @@ class MeshGraphNet(nn.Module):
         for block in self.processor:
             x, edge_attr = block(x, edge_index, edge_attr)
 
+        # Full GENERIC: the dissipative increment is built from the processor
+        # node latents (learned conductances) — the decoder is bypassed.
+        if self.generic_head is not None and self.generic_head.uses_node_latents:
+            return self.generic_head(
+                None, x_raw, batch=batch, node_latents=x, edge_index=edge_index
+            )
+
         # Decode node latents to the output quantity.
         out = self.decoder(x)
 
-        # Optional thermodynamic (GENERIC) routing. Skipped entirely when
-        # disabled (generic_head is None) -> no extra cost or parameters.
+        # Optional energy-only GENERIC routing. Skipped entirely when disabled
+        # (generic_head is None) -> no extra cost or parameters.
         if self.generic_head is not None:
             out = self.generic_head(out, x_raw, batch)
         return out
+
+    def set_normalization(self, stats: dict) -> None:
+        """Give the GENERIC head its z-score constants (no-op when disabled).
+
+        Call once on a fresh model before training; the constants are saved in
+        ``state_dict`` so checkpoint loads (rollout / spiral) restore them.
+        """
+        if self.generic_head is not None:
+            self.generic_head.set_normalization(stats)
 
     def num_parameters(self) -> int:
         """Total number of trainable parameters."""
