@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from models.meshgraphnet import (
+    EnthalpyGenericThermalHead,
     FullGenericThermalHead,
     GraphNetBlock,
     MeshGraphNet,
@@ -273,3 +274,82 @@ def test_full_generic_structure_preserving():
     assert (mu * diss).sum().item() >= -1e-4
     # 3) Heat flows hot→cold: the hottest node's dissipative increment cools it.
     assert diss[0, 0].item() < 0.0
+
+
+def test_enthalpy_generic_structure_and_latent_heat():
+    """Enthalpy-state GENERIC: energy (not T) conserved; melt-pool plateau."""
+    torch.manual_seed(0)
+    cfg = MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                             use_generic=True, generic_mode="enthalpy")
+    model = MeshGraphNet(cfg)
+    assert model.decoder is None                        # decoder bypassed
+    assert isinstance(model.generic_head, EnthalpyGenericThermalHead)
+    head = model.generic_head
+    head.set_normalization(_realistic_stats())
+
+    # Enthalpy curve must be monotonically increasing (invertible) and span the
+    # melting range where the slope (apparent heat capacity) spikes.
+    H_grid, T_grid = head.H_grid, head.T_grid
+    assert torch.all(torch.diff(H_grid) > 0)
+    slope = torch.diff(H_grid) / torch.diff(T_grid)     # ~ c_p^app / c_p^sens
+    i_melt = int(torch.argmin((T_grid - 1748.0).abs()))
+    i_cold = int(torch.argmin((T_grid - 800.0).abs()))
+    assert slope[i_melt] > 5.0 * slope[i_cold]          # latent-heat spike at melt
+
+    temps = [2000.0, 500.0, 400.0, 350.0, 300.0]
+    x, edge_index, hlat = _chain_graph(temps)
+    out = head(None, x, batch=None, node_latents=hlat, edge_index=edge_index)
+    dh = head.last_dissipative                          # Δh_diss = L_w μ (energy)
+
+    # 1) GENUINE energy conservation: Σ_i Δh_diss_i ≈ 0 (Laplacian on ENERGY).
+    assert dh.sum().abs() < 1e-3 * dh.abs().sum().clamp_min(1e-9)
+    # 2) Entropy production μᵀ L_w μ ≥ 0.
+    mu = 1.0 / torch.tensor(temps).clamp_min(head.T_FLOOR).reshape(-1, 1)
+    assert (mu * dh).sum().item() >= -1e-4
+    # 3) Output is a finite normalized ΔT.
+    assert out.shape == (5, 1) and torch.all(torch.isfinite(out))
+
+
+def test_enthalpy_enriched_source_conserves_and_starts_as_scalar():
+    """Enriched source: adds source/cool MLPs; zero-initialized (so it starts as
+    the scalar head); dissipation still conserves energy per graph."""
+    enr = MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                             use_generic=True, generic_mode="enthalpy",
+                             enriched_source=True)
+    base = MeshGraphNetConfig(hidden_dim=16, num_processing_steps=2,
+                              use_generic=True, generic_mode="enthalpy")
+    assert MeshGraphNet(enr).num_parameters() > MeshGraphNet(base).num_parameters()
+
+    torch.manual_seed(0)
+    m = MeshGraphNet(enr)
+    head = m.generic_head
+    head.set_normalization(_realistic_stats())
+    # Zero-init last layer ⇒ the modulation is 0 at init ⇒ external term equals the
+    # scalar-gain head (softplus(gain + 0) = softplus(gain)).
+    assert torch.all(head.source_mlp[-1].weight == 0) and torch.all(head.source_mlp[-1].bias == 0)
+    assert torch.all(head.cool_mlp[-1].weight == 0) and torch.all(head.cool_mlp[-1].bias == 0)
+
+    x, ei, ea, batch = _two_graph_batch()
+    out = m(x, ei, ea, batch=batch)
+    assert out.shape == (x.size(0), 1) and torch.all(torch.isfinite(out))
+    # Dissipative energy change still sums to ~0 per graph (1st law intact).
+    dh = head.last_dissipative
+    for g in batch.unique():
+        assert dh[batch == g].sum().abs() < 1e-2 * dh.abs().sum().clamp_min(1e-9)
+
+
+def test_enthalpy_latent_heat_damps_temperature_rise():
+    """The same energy input raises T far less at the melt pool than in cold metal."""
+    cfg = MeshGraphNetConfig(hidden_dim=8, num_processing_steps=1,
+                             use_generic=True, generic_mode="enthalpy")
+    head = MeshGraphNet(cfg).generic_head
+    head.set_normalization(_realistic_stats())
+    from models.meshgraphnet import _interp1d
+    # Inject the same enthalpy increment ΔH (temperature-equivalent, K) at a cold
+    # node (800 K) and a melting-range node (~1748 K); compare the resulting ΔT.
+    dH = torch.full((2, 1), 100.0)                      # K (energy-equivalent)
+    T = torch.tensor([[800.0], [1748.0]])
+    H0 = _interp1d(T, head.T_grid, head.H_grid)
+    T1 = _interp1d(H0 + dH, head.H_grid, head.T_grid)
+    dT = (T1 - T).squeeze(-1)
+    assert dT[0] > 3.0 * dT[1]                          # latent heat absorbs energy

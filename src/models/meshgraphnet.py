@@ -86,13 +86,24 @@ class MeshGraphNetConfig:
     # --- Optional GENERIC structure-preserving thermodynamic head ---
     use_generic: bool = False
     #: GENERIC dissipation operator:
-    #:   "energy" — degeneracy-only (energy-conserving projection of the decoder
-    #:              increment). Guarantees M·∇E = 0 but NOT entropy production.
-    #:   "full"   — second-law GENERIC: SPSD graph-Laplacian of learned
-    #:              conductances acting on the entropy gradient ∇S = 1/T.
-    #:              Guarantees M SPSD, M·∇E = 0, AND dS/dt ≥ 0 (hot→cold) by
-    #:              construction.
+    #:   "energy"   — degeneracy-only (energy-conserving projection of the decoder
+    #:                increment). Guarantees M·∇E = 0 but NOT entropy production.
+    #:   "full"     — second-law GENERIC on TEMPERATURE: SPSD graph-Laplacian of
+    #:                learned conductances acting on ∇S = 1/T. Guarantees M SPSD,
+    #:                M·∇E = 0, dS/dt ≥ 0. Assumes E ∝ T (constant c_p) — so its
+    #:                "energy conservation" is really temperature-sum conservation,
+    #:                inconsistent under latent heat.
+    #:   "enthalpy" — thermodynamically consistent: state = volumetric enthalpy h,
+    #:                evolve Δh = L_w·(1/T), recover T = h⁻¹(h) via the latent-heat
+    #:                curve. Genuine energy conservation + 2nd law WITH phase change.
     generic_mode: str = "energy"
+    #: Enriched external source (enthalpy mode only): replace the single scalar
+    #: source/cooling gains with a per-node learned modulation
+    #: ``softplus(gain + MLP(latents, q, T))``. The dissipative operator stays
+    #: structure-preserving; only the (non-conservative) external exchange — which
+    #: alone heats the melt-pool peak — gains the flexibility to inject enough
+    #: energy there. Zero-initialized, so it starts identical to the scalar head.
+    enriched_source: bool = False
     #: Feature-column indices the GENERIC head reads (graph_builder 12-d layout).
     temperature_index: int = 0
     goldak_index: int = 1
@@ -473,6 +484,163 @@ class FullGenericThermalHead(_GenericHeadBase):
 
 
 # ---------------------------------------------------------------------------
+# Enthalpy-state (thermodynamically consistent) GENERIC head
+# ---------------------------------------------------------------------------
+def _interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Tensor:
+    """Differentiable piecewise-linear interpolation of ``fp(xp)`` at ``x``.
+
+    ``xp`` is a 1-D, strictly increasing grid; ``x`` has shape ``(N, 1)``. Values
+    outside ``[xp[0], xp[-1]]`` are clamped (flat extrapolation). Differentiable
+    w.r.t. ``x`` (the gradient is the local slope), which is what lets the
+    enthalpy map sit inside the autograd graph.
+    """
+    xq = x.clamp(xp[0], xp[-1]).squeeze(-1)                       # (N,)
+    idx = torch.searchsorted(xp, xq.contiguous(), right=True).clamp(1, xp.numel() - 1)
+    x0, x1 = xp[idx - 1], xp[idx]
+    f0, f1 = fp[idx - 1], fp[idx]
+    wgt = (xq - x0) / (x1 - x0).clamp_min(1e-12)
+    return (f0 + wgt * (f1 - f0)).unsqueeze(-1)                   # (N, 1)
+
+
+class EnthalpyGenericThermalHead(FullGenericThermalHead):
+    """Thermodynamically consistent GENERIC head: energy (enthalpy) is the state.
+
+    This fixes the constant-``c_p`` flaw of :class:`FullGenericThermalHead`. The
+    SPSD graph-Laplacian now evolves the **volumetric enthalpy** ``h`` (energy),
+    not temperature, and temperature is recovered through the nonlinear,
+    latent-heat-aware enthalpy curve ``h(T) = ρ∫ c_p^{app}(τ)\,dτ`` (the classical
+    *enthalpy method*). Per node:
+
+        Δh_i = (L_w μ)_i + Δh^{ext}_i,   μ_i = 1/T_i,
+        T_i^{new} = h^{-1}(h(T_i) + Δh_i),
+        ΔT_i = T_i^{new} − T_i.
+
+    Because the Laplacian conserves the quantity it acts on and that quantity is
+    now **energy**, ``Σ_i (L_w μ)_i = 0`` is *genuine* energy conservation (the
+    1st law) even with latent heat; entropy production ``μᵀ L_w μ ≥ 0`` (2nd law)
+    and hot→cold flow are inherited unchanged. At the melt pool a large Δh
+    produces almost no ΔT (the enthalpy plateau), exactly as in the FEM.
+
+    The conductances ``w_ij`` (learned, symmetric, ≥0) and the source/cooling
+    gains are inherited from :class:`FullGenericThermalHead`; only the *variable
+    being conserved* changes (T → h). The enthalpy curve is a fixed physical
+    function (no learning), tabulated once from :class:`MaterialProperties`.
+    """
+
+    #: Upper temperature of the enthalpy table [K] (covers the hottest sims).
+    T_TABLE_MAX: float = 8000.0
+    TABLE_POINTS: int = 4096
+
+    def __init__(self, cfg: MeshGraphNetConfig):
+        super().__init__(cfg)
+        # Tabulate the enthalpy curve in TEMPERATURE-EQUIVALENT units,
+        #   H(T) = ∫ c_p^app(τ)/c_p^sens dτ   [K]   ( = h(T)/(ρ c_p^sens) ),
+        # built from the (fixed) material model used by the FEM solver, so the
+        # surrogate's T<->H map is identical to the ground truth. Working in K
+        # (not J/m^3) keeps the increments O(K) and the gradients O(1): the raw
+        # enthalpy h~1e9 J/m^3 makes ∂T/∂h ~ 1/(ρc_p) ~ 2e-7, which pushes the
+        # parameter gradients below Adam's epsilon and stalls training. The
+        # rescale is a constant factor, so energy conservation is unchanged
+        # (Σ ΔH_diss = 0 ⟺ Σ Δh_diss = 0). Local import keeps `models` decoupled
+        # from the heavy `simulation` package unless this mode is used.
+        from simulation.thermal_solver import MaterialProperties
+
+        mat = MaterialProperties()
+        import numpy as _np
+        T_grid = _np.linspace(self.T_FLOOR, self.T_TABLE_MAX, self.TABLE_POINTS)
+        cp_app = mat.cp_apparent(T_grid)                          # [J/(kg K)]
+        dT = _np.diff(T_grid, prepend=T_grid[0])
+        H_grid = _np.cumsum((cp_app / mat.cp) * dT)               # [K], monotone
+        self.register_buffer("T_grid", torch.tensor(T_grid, dtype=torch.float32))
+        self.register_buffer("H_grid", torch.tensor(H_grid, dtype=torch.float32))
+        # Gains/conductances now produce ΔH in kelvin, so the temperature-scale
+        # init of the base `set_normalization` is the right one — keep it (do NOT
+        # override or mark initialized).
+
+        # Optional per-node modulation of the source/cooling gains. Input is the
+        # processor latents plus the local (normalized) drivers; the output is a
+        # log-gain correction added to the global scalar gain. Zero-initialized
+        # (last layer) so the head starts identical to the scalar-gain version,
+        # then learns where to inject more energy (the peak).
+        self.enriched_source = cfg.enriched_source
+        if self.enriched_source:
+            act = cfg.activation_factory()
+            hdim = cfg.hidden_dim
+            self.source_mlp = build_mlp(hdim + 2, hdim, 1, cfg.num_mlp_layers,
+                                        act, layer_norm=False)
+            self.cool_mlp = build_mlp(hdim + 2, hdim, 1, cfg.num_mlp_layers,
+                                      act, layer_norm=False)
+            for m in (self.source_mlp, self.cool_mlp):
+                nn.init.zeros_(m[-1].weight)
+                nn.init.zeros_(m[-1].bias)
+
+    def forward(
+        self,
+        delta_t_tilde: Optional[torch.Tensor],
+        x_raw: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+        node_latents: Optional[torch.Tensor] = None,
+        edge_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if node_latents is None or edge_index is None:
+            raise ValueError(
+                "EnthalpyGenericThermalHead requires node_latents and edge_index."
+            )
+        hlat = node_latents
+        src, dst = edge_index[0], edge_index[1]
+
+        T = self._phys_col(x_raw, self.t_idx).clamp_min(self.T_FLOOR)   # (N,1) [K]
+        tscale = self.x_std[self.t_idx].clamp_min(1e-6)
+
+        # Learned symmetric conductances (same construction as the full head).
+        hi, hj = hlat[src], hlat[dst]
+        Tsrc, Tdst = T[src], T[dst]
+        feats = torch.cat([
+            hi + hj,
+            (hi - hj) ** 2,
+            (Tsrc + Tdst) / (2.0 * tscale),
+            (Tsrc - Tdst).abs() / tscale,
+        ], dim=-1)
+        w = torch.exp(self.log_cond_scale) * F.softplus(self.cond_mlp(feats))   # (E,1) ≥ 0
+
+        mu = 1.0 / T                                              # entropy gradient ∂S/∂e
+
+        # Dissipative ENERGY change (in temperature-equivalent units H [K]):
+        # ΔH_diss = (L_w μ). Σ_i ΔH_diss_i = 0 ⇒ the 1st law (energy is conserved;
+        # H is a constant rescale of the enthalpy, so this IS energy conservation).
+        dH_diss = scatter(w * (mu[dst] - mu[src]), dst, dim=0,
+                          dim_size=hlat.size(0), reduce="sum")
+
+        # External ENERGY exchange (Goldak source adds energy; Newton boundary
+        # cooling removes it). Either the inherited scalar gains, or — when
+        # enriched — a per-node learned modulation that can inject more energy at
+        # the peak (still ≥0 heating / sign-correct cooling, so physically sound).
+        if self.enriched_source:
+            q = self._phys_col(x_raw, self.q_idx)
+            t_inf = self._phys_col(x_raw, self.tinf_idx)
+            robin = self._phys_col(x_raw, self.robin_idx)
+            q_n = x_raw[:, self.q_idx:self.q_idx + 1]
+            T_n = x_raw[:, self.t_idx:self.t_idx + 1]
+            tinf_n = x_raw[:, self.tinf_idx:self.tinf_idx + 1]
+            src_gain = F.softplus(self.source_gain
+                                  + self.source_mlp(torch.cat([hlat, q_n, T_n], dim=-1)))
+            cool_gain = F.softplus(self.cool_gain
+                                   + self.cool_mlp(torch.cat([hlat, T_n, tinf_n], dim=-1)))
+            dH_ext = src_gain * q + cool_gain * robin * (t_inf - T)
+        else:
+            dH_ext = self._external(x_raw)
+
+        # Enthalpy update, then recover temperature through the latent-heat curve.
+        H_cur = _interp1d(T, self.T_grid, self.H_grid)
+        T_new = _interp1d(H_cur + dH_diss + dH_ext, self.H_grid, self.T_grid)
+        dT_phys = T_new - T
+
+        self.last_dissipative = dH_diss.detach()                 # energy (H, [K])
+        self.last_external = dH_ext.detach()
+        return self._to_normalized_increment(dT_phys)
+
+
+# ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
 class MeshGraphNet(nn.Module):
@@ -496,14 +664,16 @@ class MeshGraphNet(nn.Module):
             raise ValueError(
                 "use_generic=True requires out_dim == 1 (scalar temperature state)."
             )
-        full_generic = cfg.use_generic and cfg.generic_mode == "full"
-        # The full GENERIC head derives the increment from learned conductances,
-        # not the decoder, so the decoder is omitted entirely in that mode.
-        self.decoder = None if full_generic else Decoder(cfg)
+        # Conductance-based heads ("full", "enthalpy") derive the increment from
+        # the processor latents, not the decoder, so the decoder is omitted there.
+        conductance_head = cfg.use_generic and cfg.generic_mode in ("full", "enthalpy")
+        self.decoder = None if conductance_head else Decoder(cfg)
         # Instantiated only when enabled -> exactly zero overhead when disabled.
         if not cfg.use_generic:
             self.generic_head = None
-        elif full_generic:
+        elif cfg.generic_mode == "enthalpy":
+            self.generic_head = EnthalpyGenericThermalHead(cfg)
+        elif cfg.generic_mode == "full":
             self.generic_head = FullGenericThermalHead(cfg)
         else:
             self.generic_head = GenericThermalHead(cfg)

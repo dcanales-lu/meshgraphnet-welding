@@ -27,31 +27,32 @@ gh repo edit dcanales-lu/meshgraphnet-welding --visibility public --accept-visib
 
 …or keep it private and use a token in Step 3 (variant shown there).
 
-**Push the current state** so the pod gets the latest code, the new 125-sim
-dataset, and the cloud scripts:
+**Push the current state** so the pod gets the latest code, configs and scripts:
 
 ```bash
-git add data/raw/*.npz config.runpod.json config.local_gpu*.json src scripts RUNPOD.md
-git commit -m "Cloud workflow: refreshed runpod config + auto-shutdown wrapper"
-git push
+git add -A && git commit -m "Cloud run" && git push
 ```
 
-(The dataset is committed via a `.gitignore` exception so one `git clone` brings
-**code + data**. Alternatively, skip committing data and regenerate it on the
-pod — see Step 3b — since the generator is seeded and deterministic.)
+**The dataset is NOT in git** (the v2 corpus is ~6.8 GB raw + ~274 GB processed
+cache — too large). It is **regenerated on the pod** from the seeded, deterministic
+generator (Step 3b) — identical bytes, no large transfer. (Only code + configs +
+`uv.lock` + docs are committed.)
 
 ---
 
 ## Step 1 — Create the pod on runpod.io
 
 1. **Pods → Deploy.**
-2. **GPU:** the model is tiny (~1.3M params); the real bottleneck is **data
-   loading**, so prefer a pod with **≥8 vCPUs**. An RTX 4090 / A5000 / L40S is
-   plenty. Pick a bigger GPU only if you also scale `hidden_dim` / `batch_size` /
-   dataset.
-3. **Template:** any official **PyTorch / CUDA 12.x** template (recent NVIDIA
-   driver). `uv` pulls the **cu128** torch wheels regardless of the base image.
-4. **Network Volume:** create/attach one (~20 GB) mounted at **`/workspace`**.
+2. **GPU:** the model is ~1.3M params but the v2 graphs are large (≤6642 nodes)
+   and the **push-forward K=2** run unrolls 2 steps. A **40–80 GB** card
+   (A100 / L40S / H100) lets you raise `batch_size` (8 on 40 GB → 16+ on 80 GB).
+   Prefer **≥16 vCPUs** (data generation + loading are CPU-bound).
+3. **Template:** any official **PyTorch / CUDA 12.x** template. `uv` pulls the
+   **cu128** torch wheels regardless of the base image.
+4. **Network Volume: ≥320 GB** mounted at **`/workspace`** — the v2 corpus needs
+   ~6.8 GB raw + **~274 GB** processed `.pt` cache (built on first training run),
+   plus checkpoints/logs. (The cache is large because graph topology is stored
+   per-timestep; a leaner on-the-fly loader is a known future optimization.)
 5. **Instance type:** **Spot/Interruptible** is cheaper and the run resumes after
    a kill (Step 6). Use On-Demand if you don't want interruptions.
 6. **Deploy** and wait for **Running**.
@@ -70,7 +71,7 @@ for your own terminal.)
 ```bash
 cd /workspace
 
-# Clone code + data onto the volume:
+# Clone the code onto the volume (data is regenerated in Step 3b, not cloned):
 git clone https://github.com/dcanales-lu/meshgraphnet-welding.git
 cd meshgraphnet-welding
 
@@ -91,13 +92,15 @@ near-no-op.
 > `git clone https://<TOKEN>@github.com/dcanales-lu/meshgraphnet-welding.git`
 > (GitHub → Settings → Developer settings → fine-grained token, read access).
 
-**Step 3b — regenerate data on the pod (only if you did NOT commit it):**
+**Step 3b — regenerate the dataset on the pod (required — it is not in git):**
 
 ```bash
-uv run python -m src.simulation.generate_dataset --num_train 100 --num_val 25 --target_steps 300
+# Deterministic (seed 0) → identical to the local v2 corpus. ~2 h on ~16 cores.
+uv run python -m src.simulation.generate_dataset --num_train 300 --num_val 60 --workers 16
 ```
 
-The `data/processed/` graph cache builds automatically on the first training run.
+The `data/processed/` graph cache (~274 GB, ~411k files) builds automatically on
+the first training run (~30–60 min) — this is why the volume must be ≥320 GB.
 
 ---
 
@@ -112,31 +115,34 @@ Run it inside **tmux** so it survives closing the web console:
 apt-get update && apt-get install -y tmux     # if tmux isn't already present
 tmux new -s train
 
-# inside tmux:
-bash scripts/runpod_train.sh config.runpod.json
+# inside tmux (the headline experiment: enthalpy GENERIC + enriched source +
+# push-forward K=2):
+bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json
 ```
 
 **Detach:** press **`Ctrl+b`** then **`d`** — training keeps running; close the
 browser tab safely. **Reattach:** `tmux attach -t train`.
 
-Within a minute you'll see:
+Within a couple of minutes (after the one-time graph-cache build) you'll see:
 
 ```
-DataSplit(train: 94 sims / ~32k graphs, val: 31 sims / ~11k graphs, ...)
-MeshGraphNet on cuda | 1291777 params | 8 processing steps
-epoch   5/100 | train_mse 9.7e-02 | val_rollout_rmse 147.7 K  <- best
+Push-forward: K=2 | ~317k training windows from 288 sims | 40000/epoch (subsampled)
+GENERIC thermodynamic head enabled (physical-units).
+MeshGraphNet on cuda | ~1.4M params | 8 processing steps
+epoch   5/80 | train_mse ... | val_rollout_rmse ... K  <- best
 ```
 
-What `config.runpod.json` does (tuned cloud recipe): up to **100 epochs**,
-**cosine** LR decay, validates every 5 epochs via full autoregressive-rollout
-RMSE, de-noised validation (`val_fraction 0.25`), `batch_size 16`,
-`num_workers 8`, `progress_bar false` (clean logs). Override any field from the
-CLI, e.g. `--hidden_dim 192 --num_processing_steps 12 --epochs 150`.
+What `config.runpod_enthalpy_pf.json` does: the thermodynamically-consistent
+**enthalpy** GENERIC head with the **enriched source**, **push-forward K=2**
+(multi-step training — the lever that aligns the objective with long rollouts),
+plateau LR, `batch_size 8` (raise to 16+ on an 80 GB card), `max_windows_per_epoch
+40000`, `max_val_sims 20`, `num_workers 16`, 80 epochs. Override any field from
+the CLI, e.g. `--pushforward_steps 3 --batch_size 16 --epochs 120`.
 
 **No-tmux alternative (`nohup`):**
 
 ```bash
-nohup bash scripts/runpod_train.sh config.runpod.json > logs/nohup.out 2>&1 &
+nohup bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json > logs/nohup.out 2>&1 &
 tail -f logs/nohup.out
 ```
 
@@ -146,17 +152,17 @@ The wrapper waits a 30 s grace window (Ctrl-C to cancel if attached), then:
 
 ```bash
 # Default — stop the pod (GPU billing ends, resumable):
-bash scripts/runpod_train.sh config.runpod.json
+bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json
 
 # Terminate fully — ends ALL pod billing; /workspace volume persists:
-SHUTDOWN_ACTION=remove bash scripts/runpod_train.sh config.runpod.json
+SHUTDOWN_ACTION=remove bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json
 
 # Stay up afterwards (debugging):
-SHUTDOWN_ACTION=none bash scripts/runpod_train.sh config.runpod.json
+SHUTDOWN_ACTION=none bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json
 
 # Run a spiral eval after training, before shutdown:
-POST_TRAIN_CMD='uv run python -m src.training.spiral_rollout --checkpoint checkpoints/best_model.pt --output_name spiral_runpod --device cuda && uv run python -m src.training.spiral_analysis --pred data/output/spiral_runpod.npz --prefix spiral_runpod' \
-  bash scripts/runpod_train.sh config.runpod.json
+POST_TRAIN_CMD='uv run python -m src.training.spiral_rollout --checkpoint checkpoints_enthsrc_pf/best_model.pt --output_name spiral_runpod --device cuda && uv run python -m src.training.spiral_analysis --pred data/output/spiral_runpod.npz --prefix spiral_runpod' \
+  bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json
 ```
 
 **`stop` vs `remove`:** `stop` halts the GPU (you still pay a small idle disk
@@ -184,12 +190,12 @@ tmux attach -t train         # full live view; Ctrl+b d to detach again
 ## Step 6 — Resume after a spot kill
 
 Relaunch a pod with the **same network volume**, open a terminal, set
-`"resume": true` in `config.runpod.json` (or pass `--resume`), and rerun:
+`"resume": true` in `config.runpod_enthalpy_pf.json` (or pass `--resume`), and rerun:
 
 ```bash
 cd /workspace/meshgraphnet-welding
 tmux new -s train
-bash scripts/runpod_train.sh config.runpod.json   # with resume:true in the config
+bash scripts/runpod_train.sh config.runpod_enthalpy_pf.json   # with resume:true in the config
 ```
 
 You'll see `Resumed from .../last_model.pt at epoch N`. Resume targets
@@ -203,7 +209,7 @@ Checkpoints/logs/plots are git-ignored, so pull them off the pod:
 
 ```bash
 # On the pod — prints a one-time code:
-runpodctl send checkpoints/best_model.pt checkpoints/stats.pt checkpoints/config.json
+runpodctl send checkpoints_enthsrc_pf/best_model.pt checkpoints_enthsrc_pf/stats.pt checkpoints_enthsrc_pf/config.json
 
 # On your laptop:
 runpodctl receive <code>

@@ -104,6 +104,15 @@ class TrainConfig:
     # single-step (teacher forcing) with dynamic noise.
     pushforward_steps: int = 1
 
+    # Per-epoch random subsample of training windows (0 = use all). Essential for
+    # large corpora where iterating every window each epoch is prohibitive.
+    max_windows_per_epoch: int = 0
+
+    # Cap the number of validation simulations used for the rollout metric
+    # (0 = all). Caps ONLY validation cost; the train/val split is unchanged, so
+    # the training data is identical and resuming stays consistent.
+    max_val_sims: int = 0
+
     # model
     hidden_dim: int = 128
     num_processing_steps: int = 8
@@ -112,7 +121,8 @@ class TrainConfig:
     use_layer_norm: bool = True
     aggregation: str = "sum"
     use_generic: bool = False  # enable GENERIC structure-preserving thermal head
-    generic_mode: str = "energy"  # "energy" (degeneracy only) | "full" (+ second law)
+    generic_mode: str = "energy"  # "energy" | "full" | "enthalpy"
+    enriched_source: bool = False  # enthalpy: per-node MLP-modulated source/cooling
 
     # simulation-level split
     val_fraction: float = 0.20
@@ -155,6 +165,7 @@ class TrainConfig:
             aggregation=self.aggregation,
             use_generic=self.use_generic,
             generic_mode=self.generic_mode,
+            enriched_source=self.enriched_source,
         )
 
     def data_config(self) -> TrainingConfig:
@@ -365,10 +376,25 @@ def train(cfg: TrainConfig) -> dict:
     # Push-forward training consumes windows of K consecutive same-sim graphs
     # (raw; noise + normalization are applied inside the unrolled loop).
     train_windows = WindowedSubset(dataset, split.train_sims, k=cfg.pushforward_steps)
-    log.info("Push-forward: K=%d | %d training windows from %d sims",
-             cfg.pushforward_steps, len(train_windows), len(split.train_sims))
+    # Optional per-epoch random subsample: with a large corpus, iterating every
+    # window each epoch is prohibitive. A RandomSampler (no replacement) draws a
+    # fresh random subset of `max_windows_per_epoch` windows each epoch, so the
+    # full pool is still covered over many epochs (the MGN random-pairs regime).
+    sampler = None
+    use_subsample = 0 < cfg.max_windows_per_epoch < len(train_windows)
+    if use_subsample:
+        from torch.utils.data import RandomSampler
+
+        sampler = RandomSampler(
+            train_windows, replacement=False,
+            num_samples=cfg.max_windows_per_epoch,
+        )
+    log.info("Push-forward: K=%d | %d training windows from %d sims%s",
+             cfg.pushforward_steps, len(train_windows), len(split.train_sims),
+             f" | {cfg.max_windows_per_epoch}/epoch (subsampled)" if use_subsample else "")
     train_loader = TorchDataLoader(
-        train_windows, batch_size=cfg.batch_size, shuffle=True,
+        train_windows, batch_size=cfg.batch_size,
+        shuffle=(sampler is None), sampler=sampler,
         num_workers=cfg.num_workers, collate_fn=collate_windows,
         pin_memory=(device.type == "cuda"),
         # Keep workers alive across epochs (avoids costly per-epoch re-spawn on
@@ -377,7 +403,14 @@ def train(cfg: TrainConfig) -> dict:
     )
     # Device-resident normalizer for the in-loop standardize / de-normalize.
     train_normalizer = _as_normalizer(normalizer, device)
-    val_results = _val_simulations(dataset, split.val_sims)
+    # Validation sims: optionally capped (cost only) — the split is unchanged so
+    # the train set and resume stay consistent. Deterministic first-N subset.
+    val_sims = split.val_sims
+    if 0 < cfg.max_val_sims < len(val_sims):
+        val_sims = val_sims[:cfg.max_val_sims]
+        log.info("Validation capped to %d/%d sims (cost only; split unchanged).",
+                 len(val_sims), len(split.val_sims))
+    val_results = _val_simulations(dataset, val_sims)
     if not val_results:
         log.warning("No validation simulations; checkpointing on train loss instead.")
 
