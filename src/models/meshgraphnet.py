@@ -503,7 +503,7 @@ def _interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Tens
 
 
 class EnthalpyGenericThermalHead(FullGenericThermalHead):
-    """Thermodynamically consistent GENERIC head: energy (enthalpy) is the state.
+    r"""Thermodynamically consistent GENERIC head: energy (enthalpy) is the state.
 
     This fixes the constant-``c_p`` flaw of :class:`FullGenericThermalHead`. The
     SPSD graph-Laplacian now evolves the **volumetric enthalpy** ``h`` (energy),
