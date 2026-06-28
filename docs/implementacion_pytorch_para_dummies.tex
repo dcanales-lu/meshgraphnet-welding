@@ -1,0 +1,875 @@
+%==============================================================================
+%  IMPLEMENTACIÓN EN PYTORCH — PARA DUMMIES
+%  Cómo está implementado en el repositorio el MPNN, la entalpía y sus tablas,
+%  el GENERIC dentro de la red, el entrenamiento push-forward (K) y la pérdida.
+%
+%  Documento hermano de "generic_entalpico_para_dummies": aquel explica QUÉ
+%  queremos hacer; éste explica CÓMO está implementado, ecuación <-> código.
+%
+%  Nivel de partida del lector: sabe entrenar una red en PyTorch (init, forward,
+%  loss, bucle de entrenamiento y validación; nivel "MNIST").
+%==============================================================================
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage[hidelinks,unicode]{hyperref}
+
+% --- macros matemáticas -------------------------------------------------------
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\Lw}{\bm{L}_{w}}
+\newcommand{\cpapp}{c_p^{\mathrm{app}}}
+\newcommand{\cpsens}{c_p^{\mathrm{sens}}}
+\newcommand{\Tinf}{T_{\infty}}
+
+% --- cajas pedagógicas --------------------------------------------------------
+\theoremstyle{definition}
+\newtheorem{idea}{Idea clave}[section]
+\theoremstyle{plain}
+
+\newcommand{\dummies}[1]{%
+  \par\smallskip\noindent
+  \colorbox{yellow!18}{\parbox{\dimexpr\linewidth-2\fboxsep}{%
+  \small\textbf{En cristiano:} #1}}\par\smallskip}
+
+% --- estilo de código ---------------------------------------------------------
+\definecolor{codebg}{rgb}{0.96,0.96,0.99}
+\definecolor{codekw}{rgb}{0.10,0.10,0.60}
+\definecolor{codecom}{rgb}{0.28,0.45,0.30}
+\definecolor{codestr}{rgb}{0.55,0.15,0.15}
+\definecolor{srcblue}{rgb}{0.12,0.25,0.55}
+
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecom}\itshape,
+  stringstyle=\color{codestr},
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0.4pt, rulecolor=\color{srcblue!40},
+  numbers=left, numberstyle=\tiny\color{gray}, numbersep=7pt,
+  showstringspaces=false, breaklines=true, breakatwhitespace=true,
+  tabsize=4, columns=fullflexible, keepspaces=true,
+  literate=%
+    {μ}{{$\mu$}}1 {Δ}{{$\Delta$}}1 {ρ}{{$\rho$}}1 {σ}{{$\sigma$}}1
+    {≥}{{$\geq$}}1 {≤}{{$\leq$}}1 {→}{{$\rightarrow$}}1 {⇒}{{$\Rightarrow$}}1
+    {·}{{$\cdot$}}1 {α}{{$\alpha$}}1 {∇}{{$\nabla$}}1 {≈}{{$\approx$}}1
+    {Σ}{{$\Sigma$}}1 {τ}{{$\tau$}}1 {ε}{{$\varepsilon$}}1 {²}{{\textsuperscript{2}}}1
+    {⟺}{{$\Leftrightarrow$}}1 {é}{{\'e}}1 {á}{{\'a}}1 {í}{{\'i}}1 {ó}{{\'o}}1
+    {ú}{{\'u}}1 {ñ}{{\~n}}1
+}
+\lstset{style=py}
+
+% cabecera "archivo — descripción" antes de cada caja de código
+\newcommand{\srcref}[1]{\par\smallskip\noindent
+  {\footnotesize\ttfamily\textcolor{srcblue}{$\blacksquare$\ #1}}\par\vspace{1pt}}
+
+\title{\bfseries Implementación en PyTorch \emph{para dummies}\\[4pt]
+  \large Del MPNN, la entalpía y el GENERIC a las líneas de código\\
+  que lo hacen: una guía del repositorio, ecuación $\leftrightarrow$ archivo}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Este es el documento \textbf{de implementación}. El documento hermano
+(\emph{GENERIC entálpico para dummies}) explicaba \emph{qué} queremos hacer y
+\emph{por qué}; aquí explicamos \emph{cómo está construido} en el repositorio,
+relacionando cada pieza de la formulación con \textbf{las líneas concretas de
+PyTorch que la implementan}, indicando siempre el \textbf{archivo y las líneas}.
+Suponemos que sabes entrenar una red en PyTorch (un MNIST: \texttt{\_\_init\_\_},
+\texttt{forward}, \emph{loss}, bucle de entrenamiento y validación). A partir de
+ahí recorremos: el mapa de la librería y el flujo de datos; el contrato de grafos
+(las 12 \emph{features}); la arquitectura \emph{Encoder--Processor--Decoder}; la
+normalización; el \emph{head} GENERIC entálpico con sus conductancias aprendidas y
+las \textbf{tablas que pasan de entalpía a temperatura}; el entrenamiento
+\emph{push-forward} con $K$ pasos y su pérdida; y la validación por \emph{rollout}.
+Al final tendrás un mapa mental completo del repo y podrás responder casi cualquier
+pregunta sobre él. Las cajas amarillas resumen ``en cristiano''; las cajas azules
+son código \textbf{real} del repositorio (a veces abreviado, marcado con
+\texttt{...}).
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==============================================================================
+\section{El mapa de la librería y el flujo de datos}
+\label{sec:mapa}
+%==============================================================================
+
+Antes de mirar una sola línea, conviene saber \textbf{qué hace cada carpeta} y
+\textbf{cómo fluye un dato} desde la física hasta una figura. Todo el código vive
+en \texttt{src/}:
+
+\begin{center}\small
+\begin{tabular}{@{}p{0.34\linewidth}p{0.60\linewidth}@{}}
+\toprule
+Archivo & Responsabilidad \\
+\midrule
+\texttt{src/simulation/thermal\_solver.py} & El \textbf{solver FEM}: resuelve la
+ecuación del calor (Goldak, $\cpapp$, $\theta$-método + Picard) y define
+\texttt{MaterialProperties} y \texttt{SimulationResult}. Es la ``verdad''. \\
+\texttt{src/simulation/generate\_dataset.py} & Genera el corpus: muestrea
+parámetros y lanza el solver en paralelo $\rightarrow$ \texttt{.npz}. \\
+\texttt{src/data/graph\_builder.py} & Convierte cada \texttt{.npz} en
+\textbf{grafos PyG} (12 features de nodo, 3 de arista, target $\Delta T$);
+normalización; el \texttt{Dataset} de PyTorch. \\
+\texttt{src/models/meshgraphnet.py} & La \textbf{red}: Encoder/Processor/Decoder y
+los \emph{heads} GENERIC (incluido el \textbf{entálpico} con su tabla). \\
+\texttt{src/training/utils.py} & \emph{Split} por simulación, ruido de
+entrenamiento, y las \textbf{ventanas} \texttt{WindowedSubset}/\texttt{collate\_windows}
+del push-forward. \\
+\texttt{src/training/train.py} & El \textbf{bucle de entrenamiento}: push-forward
+$K$, pérdida, optimizador, \emph{scheduler}, \emph{checkpoints}, validación. \\
+\texttt{src/training/rollout.py} & El \textbf{rollout autoregresivo} (inferencia)
+y su exportación; es la métrica de validación. \\
+\texttt{src/training/spiral\_*.py}, \texttt{val\_analysis.py} & Evaluación
+fuera-de-distribución (la espiral) y análisis/figuras. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+El \textbf{flujo de datos} de punta a punta:
+\begin{center}\small\ttfamily
+parámetros $\rightarrow$ [thermal\_solver] $\rightarrow$ sim\_*.npz (campos T en el tiempo)\\
+$\rightarrow$ [graph\_builder] $\rightarrow$ data\_\{sim\}\_\{t\}.pt (grafos) + stats.pt\\
+$\rightarrow$ [train.py] $\rightarrow$ best\_model.pt / last\_model.pt\\
+$\rightarrow$ [rollout.py / spiral\_*] $\rightarrow$ .npz + .xdmf + figuras
+\end{center}
+
+\dummies{Cinco etapas: el solver hace la física (\texttt{.npz}); el
+\emph{graph\_builder} la vuelve grafos (\texttt{.pt}); \emph{train.py} aprende y
+guarda pesos; \emph{rollout.py} despliega la red sobre una simulación entera y la
+compara con la verdad. Cada flecha es un archivo. Quédate con esto y ya sabes
+``dónde mirar'' para cualquier pregunta.}
+
+\begin{idea}[El contrato que une todo]
+Tres constantes amarran toda la librería y aparecen una y otra vez:
+\textbf{12 features de nodo} (orden fijo en \texttt{NODE\_FEATURE\_NAMES}),
+\textbf{3 de arista} \texttt{[dx,dy,dist]}, y el \textbf{target} $\bm
+y=\Delta T=T^{t+1}-T^{t}$. El modelo \emph{solo} predice $\Delta T$; todo lo demás
+(features, normalización, rollout) gira alrededor de ese contrato.
+\end{idea}
+
+%==============================================================================
+\section{El contrato de datos: qué es ``un grafo'' aquí}
+\label{sec:datos}
+%==============================================================================
+
+\subsection{Las 12 features de nodo y el target}
+
+Cada par de fotogramas consecutivos $(T^t,T^{t+1})$ de una simulación se convierte
+en \textbf{un grafo}: los nodos de la malla son nodos del grafo, las aristas de la
+malla son aristas (en ambos sentidos), las features describen el estado en $t$ y el
+target es el incremento de temperatura. El orden de las 12 columnas es \textbf{fijo}
+y todo el código lo referencia por nombre/índice:
+
+\srcref{src/data/graph\_builder.py — l.48--73 (layout de features)}
+\begin{lstlisting}
+NODE_FEATURE_NAMES = [
+    "T",            # 0  temperatura actual  <- la UNICA que se "rolla"
+    "q_goldak",     # 1  fuente Goldak analitica en el nodo
+    "dx_local",     # 2  coord. relativa co-movil (tangente)
+    "dy_local",     # 3  coord. relativa co-movil (normal)
+    "net_power",    # 4  parametro de proceso: eta * P
+    "speed",        # 5  velocidad de soldadura v
+    "bc_interior",  # 6  one-hot tipo de nodo
+    "bc_dirichlet", # 7  one-hot tipo de nodo
+    "bc_robin",     # 8  one-hot tipo de nodo
+    "h_conv",       # 9  coef. de conveccion local
+    "emissivity",   # 10 emisividad local
+    "T_inf",        # 11 temperatura ambiente local
+]
+NORMALIZE_MASK = np.ones(NUM_NODE_FEATURES, dtype=bool)
+NORMALIZE_MASK[[6, 7, 8]] = False   # los one-hot NO se normalizan
+\end{lstlisting}
+
+Dos decisiones de diseño con consecuencias enormes:
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Solo features relativas}: no hay coordenadas absolutas. La posición
+  del arco entra como \texttt{q\_goldak} (la fuente evaluada en el nodo) y como las
+  coordenadas co-móviles \texttt{[dx\_local, dy\_local]} en el marco
+  (tangente, normal) de la antorcha. La geometría de la malla entra solo por las
+  aristas. Así el modelo no memoriza posiciones: aprende física local.
+  \item \textbf{La columna 0 (T) es la única que se realimenta} en el rollout (lo
+  veremos en §\ref{sec:rollout}); las otras 11 se conocen de antemano para todos
+  los pasos.
+\end{itemize}
+
+El target se construye así (resta de fotogramas), y cada grafo se empaqueta como un
+\texttt{Data} de PyTorch Geometric:
+
+\srcref{src/data/graph\_builder.py — build\_graph\_sequence, l.246--260 (abreviado)}
+\begin{lstlisting}
+for t in range(n_pairs):
+    x_np = build_node_features(result, t, speeds[t], node_type, bc_values, goldak)
+    y_np = (result.temperature[t+1] - result.temperature[t]).reshape(-1, 1)  # dT
+    data = Data(
+        x=torch.as_tensor(x_np, dtype=torch.float32),         # (N, 12)
+        edge_index=edge_index,                                 # (2, 2E) bidireccional
+        edge_attr=edge_attr,                                   # (2E, 3) [dx,dy,dist]
+        y=torch.as_tensor(y_np, dtype=torch.float32),          # (N, 1) = dT
+        pos=pos,                                               # (N,2) SOLO para dibujar
+    )
+\end{lstlisting}
+
+\dummies{Un grafo $=$ una foto del estado en $t$ (12 números por nodo) $+$ la
+respuesta correcta $\Delta T$ por nodo. ``Entrenar'' es enseñar a la red a predecir
+ese $\Delta T$. Fíjate que \texttt{pos} (coordenadas) se guarda aparte y nunca entra
+en \texttt{x}: es solo para ParaView.}
+
+\subsection{Las aristas y la fuente Goldak}
+
+Las aristas se construyen una vez por malla (las tres aristas de cada triángulo,
+sin duplicados, en ambos sentidos), y sus features son el desplazamiento
+$[\Delta x,\Delta y,\lVert\bm u_{ij}\rVert]$. La \texttt{q\_goldak} de cada nodo la
+calcula la \emph{misma} función del solver (\texttt{goldak\_flux}), multiplicada por
+un ``power\_ratio'' que vale 1 soldando y 0 en el enfriamiento (cuando el arco se
+apaga). No nos detenemos: lo importante es que \textbf{todas las features
+dependientes del tiempo se calculan con el mismo código en entrenamiento y en
+inferencia} (paridad), lo que evita el clásico \emph{train/test skew}.
+
+%==============================================================================
+\section{La arquitectura MPNN en PyTorch}
+\label{sec:mpnn}
+%==============================================================================
+
+El modelo es el \emph{MeshGraphNet} (Pfaff et al.) clásico:
+\textbf{Encoder $\rightarrow$ Processor $\rightarrow$ Decoder}. Todo está en
+\texttt{src/models/meshgraphnet.py}.
+
+\subsection{El ladrillo: un MLP configurable}
+
+Todas las subredes son MLPs construidos por la misma fábrica: \texttt{num\_mlp\_layers}
+capas ocultas de ancho \texttt{hidden\_dim} con activación, y al final una proyección
+lineal (más un \texttt{LayerNorm} opcional, estándar en MeshGraphNets para estabilizar
+las latentes; el decoder es la excepción, sin LayerNorm, para poder emitir valores
+físicos sin acotar).
+
+\srcref{src/models/meshgraphnet.py — build\_mlp, l.140--149}
+\begin{lstlisting}
+layers = []
+dim = in_dim
+for _ in range(num_hidden_layers):
+    layers.append(nn.Linear(dim, hidden_dim)); layers.append(activation())
+    dim = hidden_dim
+layers.append(nn.Linear(dim, out_dim))
+if layer_norm:
+    layers.append(nn.LayerNorm(out_dim))
+return nn.Sequential(*layers)
+\end{lstlisting}
+
+\subsection{Encoder: subir features a la latente}
+
+Dos MLPs independientes llevan las features crudas de nodo (12-d) y de arista (3-d)
+a un espacio latente compartido de ancho $d=128$. Esto es la ecuación
+$\bm v_i^{(0)}=\mathrm{MLP}_{\mathrm{enc}}^{v}(\bm x_i)$,
+$\bm\epsilon_{ij}^{(0)}=\mathrm{MLP}_{\mathrm{enc}}^{e}(\bm e_{ij})$.
+
+\srcref{src/models/meshgraphnet.py — Encoder.forward, l.170--173}
+\begin{lstlisting}
+def forward(self, x, edge_attr):
+    return self.node_mlp(x), self.edge_mlp(edge_attr)   # (N,d), (2E,d)
+\end{lstlisting}
+
+\subsection{Processor: el paso de mensajes (el corazón)}
+
+El Processor es una \textbf{pila de $L=8$ bloques} \texttt{GraphNetBlock}. Cada
+bloque hace tres cosas, con \textbf{conexiones residuales} (sumar la entrada) para
+que el gradiente sobreviva la pila profunda y el BPTT del push-forward:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Actualiza cada arista} a partir de sí misma y de sus dos extremos:
+  $\bm\epsilon_{ij}\leftarrow\bm\epsilon_{ij}+\mathrm{MLP}_e([\bm\epsilon_{ij},\bm v_i,\bm v_j])$.
+  \item \textbf{Agrega} los mensajes en el nodo receptor (suma): aquí es donde el
+  ``message passing'' mueve información entre vecinos. Se hace con
+  \texttt{scatter} (una suma segmentada vectorizada).
+  \item \textbf{Actualiza cada nodo} con su estado y la suma de mensajes:
+  $\bm v_j\leftarrow\bm v_j+\mathrm{MLP}_v([\bm v_j,\bm m_j])$.
+\end{enumerate}
+
+\srcref{src/models/meshgraphnet.py — GraphNetBlock.forward, l.209--224}
+\begin{lstlisting}
+src, dst = edge_index[0], edge_index[1]          # emisor i, receptor j
+# 1) update de arista (residual)
+edge_inputs = torch.cat([edge_attr, x[src], x[dst]], dim=-1)
+edge_attr = edge_attr + self.edge_mlp(edge_inputs)
+# 2) agregacion en el receptor (suma segmentada vectorizada)
+aggregated = scatter(edge_attr, dst, dim=0, dim_size=x.size(0), reduce="sum")
+# 3) update de nodo (residual)
+node_inputs = torch.cat([x, aggregated], dim=-1)
+x = x + self.node_mlp(node_inputs)
+return x, edge_attr
+\end{lstlisting}
+
+\dummies{\texttt{scatter(..., dst, reduce="sum")} es ``para cada nodo receptor,
+suma los mensajes de sus aristas''. Es la versión rápida del sumatorio
+$\bm m_j=\sum_{i\in\mathcal N(j)}\bm\epsilon_{ij}$. Con 8 bloques, la información
+viaja hasta 8 aristas: ese es el ``radio de visión'' alrededor del arco.}
+
+\subsection{El ensamblaje y el forward}
+
+\texttt{MeshGraphNet.forward} encadena todo. La parte sutil es el \textbf{enrutado
+del head}: si hay un head de conductancias (\texttt{full}/\texttt{enthalpy}), el
+incremento se construye desde las \emph{latentes del processor} y \textbf{el decoder
+se omite}; si no, se decodifica normalmente.
+
+\srcref{src/models/meshgraphnet.py — MeshGraphNet.forward, l.708--732 (abreviado)}
+\begin{lstlisting}
+x_raw = x                                   # guardamos features crudas para el head
+x, edge_attr = self.encoder(x, edge_attr)
+for block in self.processor:                # L = 8 hops
+    x, edge_attr = block(x, edge_index, edge_attr)
+
+# heads de conductancias (full/enthalpy): el incremento sale de las latentes,
+# NO del decoder (que se omite) -> garantiza la estructura GENERIC.
+if self.generic_head is not None and self.generic_head.uses_node_latents:
+    return self.generic_head(None, x_raw, batch=batch,
+                             node_latents=x, edge_index=edge_index)
+
+out = self.decoder(x)                        # baseline (sin GENERIC)
+if self.generic_head is not None:            # head "energy-only" (proyeccion)
+    out = self.generic_head(out, x_raw, batch)
+return out
+\end{lstlisting}
+
+\begin{idea}[Por qué el decoder se ``puentea'']
+En el GENERIC entálpico, el incremento \emph{no} puede ser un número libre por nodo
+(eso violaría la degeneración $\Lw\bm 1=\bm0$). Tiene que salir de la
+\textbf{Laplaciana de conductancias} actuando sobre $\mu=1/T$. Por eso, en ese modo,
+el processor produce las \emph{latentes} con las que el head calcula las
+conductancias, y el decoder libre se descarta (ni se instancia, l.669--670).
+\end{idea}
+
+%==============================================================================
+\section{Normalización: por qué el head trabaja en kelvin físico}
+\label{sec:norm}
+%==============================================================================
+
+La red se alimenta con features \textbf{normalizadas} (z-score) y emite un
+$\Delta T$ \textbf{normalizado}. Las constantes se calculan una vez sobre todo el
+corpus y se guardan en \texttt{stats.pt}:
+
+\srcref{src/data/graph\_builder.py — NormalizeTransform, l.282--292}
+\begin{lstlisting}
+def __call__(self, data):
+    x = data.x.clone(); m = self.mask                 # m = NORMALIZE_MASK
+    x[:, m] = (x[:, m] - self.x_mean[m]) / self.x_std[m]   # z-score (one-hot intactos)
+    data.x = x
+    if data.y is not None:
+        data.y = (data.y - self.y_mean) / self.y_std
+    return data
+
+def inverse_y(self, y):                               # vuelve a kelvin fisico
+    return y * self.y_std + self.y_mean
+\end{lstlisting}
+
+Aquí aparece una tensión: el \textbf{head GENERIC necesita pensar en física}
+(temperaturas en kelvin, $\mu=1/T$, energías), pero recibe features
+\emph{normalizadas}. La solución: el head guarda sus propias copias de las
+constantes (como \emph{buffers}, así viajan en el \texttt{state\_dict} y con
+\texttt{.to(device)}) y \textbf{des-normaliza por dentro}. Se cargan una vez con
+\texttt{set\_normalization}:
+
+\srcref{src/models/meshgraphnet.py — \_GenericHeadBase, l.304--309 y \_phys\_col, l.338--343}
+\begin{lstlisting}
+self.register_buffer("x_mean", torch.zeros(f)); self.register_buffer("x_std", torch.ones(f))
+self.register_buffer("y_mean", torch.zeros(1)); self.register_buffer("y_std", torch.ones(1))
+# ...
+def _phys_col(self, x_raw, idx):                 # des-normaliza la columna idx a kelvin
+    c = x_raw[:, idx:idx+1]
+    if bool(self.norm_mask[idx]):
+        c = c * self.x_std[idx] + self.x_mean[idx]
+    return c
+\end{lstlisting}
+
+\dummies{La red habla en ``unidades normalizadas''; la física habla en kelvin. El
+head es el traductor: des-normaliza la temperatura para calcular $1/T$, hace toda la
+termodinámica en kelvin, y al final vuelve a normalizar el $\Delta T$ para cumplir el
+contrato de salida. Las constantes viajan dentro del modelo, así que un
+\emph{checkpoint} reproduce la física exacta.}
+
+En \texttt{train.py} esto se conecta con una sola línea tras crear el modelo:
+
+\srcref{src/training/train.py — l.418--422}
+\begin{lstlisting}
+model = MeshGraphNet(cfg.model_config()).to(device)
+if cfg.use_generic:
+    model.set_normalization(stats)   # da al head las constantes z-score (en buffers)
+\end{lstlisting}
+
+%==============================================================================
+\section{El GENERIC dentro de la red: conductancias y la tabla de entalpía}
+\label{sec:generic}
+%==============================================================================
+
+Llegamos al núcleo: cómo \texttt{EnthalpyGenericThermalHead} implementa, línea a
+línea, las ecuaciones del documento de formulación
+\[
+  \Delta H_i^{\mathrm{diss}}=\sum_{j\sim i} w_{ij}\Big(\tfrac1{T_i}-\tfrac1{T_j}\Big),
+  \quad
+  T_i^{\mathrm{new}}=H^{-1}\!\big(H(T_i)+\Delta H_i^{\mathrm{diss}}+\Delta H_i^{\mathrm{ext}}\big),
+  \quad
+  \Delta T_i=T_i^{\mathrm{new}}-T_i .
+\]
+
+\subsection{La jerarquía de \emph{heads}}
+
+Hay tres heads, en herencia creciente (\texttt{generic\_mode}):
+\texttt{"energy"} (solo degeneración, proyecta el incremento del decoder),
+\texttt{"full"} (Laplaciana SPSD sobre \textbf{temperatura}) y \texttt{"enthalpy"}
+(Laplaciana SPSD sobre \textbf{energía}; el correcto). \texttt{Enthalpy} hereda de
+\texttt{Full} y solo cambia ``la variable que se conserva'' ($T\rightarrow h$) más
+las tablas. El enrutado por modo está en el constructor del modelo:
+
+\srcref{src/models/meshgraphnet.py — MeshGraphNet.\_\_init\_\_, l.669--679}
+\begin{lstlisting}
+conductance_head = cfg.use_generic and cfg.generic_mode in ("full", "enthalpy")
+self.decoder = None if conductance_head else Decoder(cfg)   # se OMITE el decoder
+if not cfg.use_generic:           self.generic_head = None
+elif cfg.generic_mode == "enthalpy": self.generic_head = EnthalpyGenericThermalHead(cfg)
+elif cfg.generic_mode == "full":     self.generic_head = FullGenericThermalHead(cfg)
+else:                                self.generic_head = GenericThermalHead(cfg)
+\end{lstlisting}
+
+\subsection{Las conductancias aprendidas $w_{ij}\ge0$, simétricas}
+
+La matriz $\bm M=\Lw$ se realiza como una Laplaciana de \textbf{conductancias
+aprendidas}. Un MLP por arista produce un escalar no negativo (vía
+\texttt{softplus}), multiplicado por una escala global aprendida
+$e^{\alpha}$. El truco de la \textbf{simetría $w_{ij}=w_{ji}$ gratis}: el MLP solo
+recibe features \emph{simétricas} bajo el intercambio $i\leftrightarrow j$
+($\bm h_i+\bm h_j$, $(\bm h_i-\bm h_j)^2$, $T_i+T_j$, $|T_i-T_j|$).
+
+\srcref{src/models/meshgraphnet.py — EnthalpyGenericThermalHead.forward, l.596--604}
+\begin{lstlisting}
+hi, hj = hlat[src], hlat[dst]
+Tsrc, Tdst = T[src], T[dst]
+feats = torch.cat([
+    hi + hj,                       # simetrico bajo i<->j
+    (hi - hj) ** 2,                # simetrico
+    (Tsrc + Tdst) / (2.0 * tscale),
+    (Tsrc - Tdst).abs() / tscale,
+], dim=-1)
+w = torch.exp(self.log_cond_scale) * F.softplus(self.cond_mlp(feats))   # (E,1) >= 0
+\end{lstlisting}
+
+\subsection{La acción de la Laplaciana, con \texttt{scatter}}
+
+Con $\mu_i=1/T_i$, el incremento disipativo es la acción de la Laplaciana,
+$(\Lw\mu)_i=\sum_{j\sim i}w_{ij}(\mu_i-\mu_j)$. En código: por cada arista dirigida
+$s\!\rightarrow\!r$ se aporta $w\,(\mu_r-\mu_s)$ al receptor, y se suma con
+\texttt{scatter}. Como las aristas son bidireccionales, esto es exactamente la
+Laplaciana SPSD, y su suma por grafo es cero (energía conservada):
+
+\srcref{src/models/meshgraphnet.py — EnthalpyGenericThermalHead.forward, l.606--612}
+\begin{lstlisting}
+mu = 1.0 / T                                            # gradiente de entropia dS/de = 1/T
+# dH_diss = (L_w mu): Sigma_i dH_diss_i = 0  => 1er principio (energia conservada)
+dH_diss = scatter(w * (mu[dst] - mu[src]), dst, dim=0,
+                  dim_size=hlat.size(0), reduce="sum")
+\end{lstlisting}
+
+\begin{idea}[Ecuación $\leftrightarrow$ código, la traducción exacta]
+\[
+\underbrace{(\Lw\mu)_i=\!\!\sum_{j\sim i}\!w_{ij}(\mu_i-\mu_j)}_{\text{matemáticas}}
+\;\;\equiv\;\;
+\underbrace{\texttt{scatter(w*(mu[dst]-mu[src]), dst, reduce="sum")}}_{\text{PyTorch}}
+\]
+La conservación $\sum_i\Delta H_i^{\mathrm{diss}}=0$ \textbf{no se impone con una
+penalización}: es una identidad algebraica de la Laplaciana (suma cero por columnas),
+así que se cumple exactamente en cada \emph{forward}, gratis.
+\end{idea}
+
+\subsection{Las tablas que pasan de entalpía a temperatura}
+
+Aquí está ``el rollo de las $c_p$'' hecho código. La curva $H(T)$ se \textbf{tabula
+una sola vez} en el constructor, a partir del \emph{mismo} modelo de material que usa
+el FEM (\texttt{MaterialProperties.cp\_apparent}), de modo que el mapa $T\leftrightarrow
+H$ del sustituto es idéntico al de la verdad. Y se tabula en \textbf{unidades de
+kelvin} ($H=h/(\rho\cpsens)$), no en J/m$^3$: ése es el reescalado de
+acondicionamiento que evita que los gradientes se hundan bajo el $\varepsilon$ de Adam.
+
+\srcref{src/models/meshgraphnet.py — EnthalpyGenericThermalHead.\_\_init\_\_, l.546--555}
+\begin{lstlisting}
+from simulation.thermal_solver import MaterialProperties
+mat = MaterialProperties()
+T_grid = np.linspace(self.T_FLOOR, self.T_TABLE_MAX, self.TABLE_POINTS)  # 200..8000 K, 4096 pts
+cp_app = mat.cp_apparent(T_grid)                       # [J/(kg K)] con calor latente
+dT = np.diff(T_grid, prepend=T_grid[0])
+H_grid = np.cumsum((cp_app / mat.cp) * dT)             # H(T) en [K], MONOTONA
+self.register_buffer("T_grid", torch.tensor(T_grid, dtype=torch.float32))
+self.register_buffer("H_grid", torch.tensor(H_grid, dtype=torch.float32))
+\end{lstlisting}
+
+La \texttt{cp\_apparent} es las dos campanas gaussianas (fusión + vaporización) del
+documento de formulación, ecuación del $\cpapp$:
+
+\srcref{src/simulation/thermal\_solver.py — MaterialProperties.cp\_apparent, l.93--101}
+\begin{lstlisting}
+Tm = 0.5 * (self.T_solidus + self.T_liquidus); s = (self.T_liquidus - self.T_solidus)/4.0
+dfl_dT = np.exp(-(((T - Tm)/s)**2)) / (s*np.sqrt(np.pi))                # campana fusion
+s_v = self.vap_width/4.0
+dfv_dT = np.exp(-(((T - self.T_vaporization)/s_v)**2)) / (s_v*np.sqrt(np.pi))  # campana vapor
+return self.cp + self.latent_heat*dfl_dT + self.latent_heat_vap*dfv_dT  # = cp_app
+\end{lstlisting}
+
+¿Cómo se evalúa $H(T)$ y su inversa $T=H^{-1}(\cdot)$ \emph{dentro} del grafo de
+autograd? Con una interpolación lineal a trozos \textbf{diferenciable}
+(\texttt{\_interp1d}): busca el tramo con \texttt{searchsorted} y mezcla linealmente.
+Su derivada es la pendiente local (finita), justo lo que necesita el backprop.
+
+\srcref{src/models/meshgraphnet.py — \_interp1d, l.497--502}
+\begin{lstlisting}
+xq = x.clamp(xp[0], xp[-1]).squeeze(-1)
+idx = torch.searchsorted(xp, xq.contiguous(), right=True).clamp(1, xp.numel()-1)
+x0, x1 = xp[idx-1], xp[idx]; f0, f1 = fp[idx-1], fp[idx]
+wgt = (xq - x0) / (x1 - x0).clamp_min(1e-12)
+return (f0 + wgt*(f1 - f0)).unsqueeze(-1)
+\end{lstlisting}
+
+\dummies{Dos vectores, \texttt{T\_grid} y \texttt{H\_grid}, son la curva $h(T)$ del
+otro documento (la rampa con dos rellanos). Ir de $T$ a $H$ es interpolar en una;
+ir de $H$ a $T$ es interpolar en la otra. Como son \emph{buffers}, viajan en el
+\emph{checkpoint}: el modelo lleva su propia física dentro.}
+
+\subsection{El \emph{forward} completo del head entálpico}
+
+Ahora se lee de un tirón, y es \textbf{exactamente} las tres ecuaciones del
+encabezado de §\ref{sec:generic}: calcular la energía actual en $H$, sumar lo
+disipativo y lo externo, y volver a $T$ invirtiendo la curva.
+
+\srcref{src/models/meshgraphnet.py — EnthalpyGenericThermalHead.forward, l.633--640}
+\begin{lstlisting}
+# actualizacion de entalpia, y recuperar T por la curva de calor latente
+H_cur = _interp1d(T, self.T_grid, self.H_grid)                 # H(T_i)
+T_new = _interp1d(H_cur + dH_diss + dH_ext, self.H_grid, self.T_grid)  # H^{-1}(...)
+dT_phys = T_new - T                                            # dT_i
+return self._to_normalized_increment(dT_phys)                 # vuelve a unidades normalizadas
+\end{lstlisting}
+
+\begin{idea}[Por qué el calor latente sale ``gratis'']
+En la meseta de fusión la \texttt{H\_grid} es casi vertical, así que la segunda
+\texttt{\_interp1d} (de $H$ a $T$) devuelve un $T$ casi igual aunque le sumes mucho
+$\Delta H$: un gran $\Delta H$ produce un $\Delta T$ minúsculo, \emph{igual que en el
+FEM}. El ``freno $1/(\rho\cpapp)$'' del que hablaba el otro documento es,
+literalmente, la pendiente de la curva tabulada.
+\end{idea}
+
+\subsection{La fuente enriquecida}
+
+La parte disipativa solo enfría; quien calienta el pico es la \textbf{fuente
+externa} $\Delta H^{\mathrm{ext}}$. En la versión enriquecida, las ganancias
+escalares se modulan por nodo con dos MLPs, \textbf{inicializados a cero} (así
+arranca idéntico a la versión escalar), con \texttt{softplus}$\ge0$ y
+\emph{gateado} por la fuente Goldak $q$ (no puede inventar energía lejos del arco):
+
+\srcref{src/models/meshgraphnet.py — \_\_init\_\_ (zero-init), l.569--575 y forward, l.625--629}
+\begin{lstlisting}
+self.source_mlp = build_mlp(hdim+2, hdim, 1, ...); self.cool_mlp = build_mlp(hdim+2, hdim, 1, ...)
+for m in (self.source_mlp, self.cool_mlp):
+    nn.init.zeros_(m[-1].weight); nn.init.zeros_(m[-1].bias)   # arranca = ganancia escalar
+# ... en el forward:
+src_gain  = F.softplus(self.source_gain + self.source_mlp(torch.cat([hlat, q_n, T_n], -1)))
+cool_gain = F.softplus(self.cool_gain   + self.cool_mlp(torch.cat([hlat, T_n, tinf_n], -1)))
+dH_ext = src_gain * q + cool_gain * robin * (t_inf - T)        # >=0 calienta / signo-correcto enfria
+\end{lstlisting}
+
+Nótese que \texttt{dH\_diss} \textbf{no se toca}: sigue siendo estructura-preservante.
+Solo el término externo (que de todos modos no está sujeto a las garantías) gana
+flexibilidad. Energía interna conservada y $\dd S/\dd t\ge0$ se mantienen.
+
+%==============================================================================
+\section{El entrenamiento: datos, ventanas y push-forward}
+\label{sec:train}
+%==============================================================================
+
+\subsection{El \texttt{Dataset} y el \emph{cache} en disco}
+
+\texttt{WeldingGraphDataset} es un \texttt{Dataset} de PyG perezoso: procesa los
+\texttt{.npz} crudos a un \texttt{.pt} por par de fotogramas, calcula
+\texttt{stats.pt} (las constantes de normalización, en \emph{streaming} para no
+cargar todo en RAM) y mantiene un \textbf{índice determinista}
+\texttt{\_index = [(fname, sim\_idx, t)]} ordenado por $(\text{sim},t)$. Ese índice
+es la clave que luego usan el \emph{split} y las ventanas.
+
+\srcref{src/data/graph\_builder.py — process() (acumuladores) l.383--394 y get() l.421--426}
+\begin{lstlisting}
+xn = data.x.numpy().astype(np.float64)
+x_sum += xn.sum(0); x_sqsum += (xn**2).sum(0); x_count += xn.shape[0]   # media/var en streaming
+torch.save(data, processed_dir / f"data_{sim_idx}_{t}.pt")             # un .pt por grafo
+# ...
+def get(self, idx):
+    fname, sim_idx, t = self._index[idx]
+    return torch.load(processed_dir / f"data_{sim_idx}_{t}.pt", weights_only=False)
+\end{lstlisting}
+
+\subsection{Split por simulación (no por grafo)}
+
+Crucial en SciML: si parties por grafo, fotogramas casi idénticos del mismo cordón
+caen en train y val, e inflas el resultado. Aquí se baraja la \textbf{lista de
+simulaciones} (con semilla) y \textbf{cada grafo hereda el fold de su simulación}.
+
+\srcref{src/training/utils.py — split\_by\_simulation, l.180--188 (abreviado)}
+\begin{lstlisting}
+for graph_idx, sim in enumerate(ids):          # ids[graph] = simulacion de ese grafo
+    if   sim in train_sims: train_idx.append(graph_idx)
+    elif sim in val_sims:   val_idx.append(graph_idx)
+    else:                   test_idx.append(graph_idx)
+\end{lstlisting}
+
+\subsection{Las ventanas del push-forward}
+
+Para entrenar con $K$ pasos hace falta servir \textbf{ventanas de $K$ grafos
+consecutivos de la misma simulación}. \texttt{WindowedSubset} precalcula los
+arranques válidos (mismo \texttt{sim\_idx} en los dos extremos $\Rightarrow$ los $K$
+del medio son consecutivos):
+
+\srcref{src/training/utils.py — WindowedSubset, l.425--439 (abreviado)}
+\begin{lstlisting}
+for i in range(n - self.k + 1):
+    if int(index[i][1]) not in train: continue          # arranque en sim de train
+    if int(index[i + self.k - 1][1]) == int(index[i][1]):   # K consecutivos sin cruzar sim
+        self.starts.append(i)
+# ...
+def __getitem__(self, j):
+    i = self.starts[j]
+    return [self.base.get(i + k) for k in range(self.k)]   # lista de K grafos crudos
+\end{lstlisting}
+
+Y \texttt{collate\_windows} reorganiza un \emph{batch} de $B$ ventanas en $K$
+\textbf{mini-batches alineados por paso}: el batch $k$ junta el $k$-ésimo grafo de
+cada ventana. Como dentro de una ventana el orden de nodos es idéntico (misma
+simulación) y las ventanas se concatenan en el mismo orden en cada $k$, \textbf{el
+nodo $j$ del batch $k$ es el nodo $j$ del batch $k{+}1$}: por eso un único vector
+\texttt{T\_hat} se puede ``rodar'' por toda la ventana.
+
+\srcref{src/training/utils.py — collate\_windows, l.453--454}
+\begin{lstlisting}
+k = len(batch[0])
+return [Batch.from_data_list([window[step] for window in batch]) for step in range(k)]
+\end{lstlisting}
+
+\dummies{Una ``ventana'' son $K$ fotogramas seguidos del mismo cordón. El
+\emph{collate} los apila de forma que el nodo $j$ siempre es el mismo nodo físico a
+lo largo de los $K$ pasos. Eso permite realimentar la predicción paso a paso dentro
+del batch, que es justo lo que pide el push-forward.}
+
+\subsection{El bucle de una época: push-forward y la pérdida con $K$}
+
+Esta es la función estrella, y es el \textbf{Algoritmo de push-forward} del paper.
+Se siembra $\hat T$ con el campo verdadero (más ruido) al inicio de la ventana; se
+rueda el modelo $K$ pasos \textbf{realimentando su propia predicción} (sin
+\texttt{detach}, para que el gradiente atraviese todo el desenrollado: BPTT); y se
+acumula el MSE en temperatura física escalado por $\sigma_T$.
+
+\srcref{src/training/train.py — \_train\_one\_epoch, l.286--309 (abreviado)}
+\begin{lstlisting}
+# 1) sembrar T desde el inicio de la ventana, con ruido proporcional a la temperatura
+T_hat = dynamic_temperature_noise(b0.x[:, TEMPERATURE_INDEX].clone(),
+                                  b0.x[:, T_INF_INDEX], beta=beta, floor=floor)
+loss = b0.x.new_zeros(())
+for bk in steps:                                  # K pasos
+    x = bk.x.clone(); x[:, TEMPERATURE_INDEX] = T_hat   # realimenta nuestra prediccion
+    x_norm = x.clone()
+    x_norm[:, mask] = (x[:, mask] - nt.x_mean[mask]) / nt.x_std[mask]   # normaliza
+    dT = nt.inverse_y(model(x_norm, bk.edge_index, bk.edge_attr, batch=bk.batch)).squeeze(-1)
+    T_pred = T_hat + dT
+    T_true = bk.x[:, TEMPERATURE_INDEX] + bk.y[:, 0]          # T verdadera del paso k
+    loss = loss + (((T_pred - T_true) / t_scale) ** 2).mean() # MSE escalado por sigma_T
+    T_hat = T_pred                                            # feed-forward (SIN detach -> BPTT)
+loss = loss / len(steps)
+loss.backward()
+if grad_clip > 0: clip_grad_norm_(model.parameters(), grad_clip)
+optimizer.step()
+\end{lstlisting}
+
+Esto implementa
+$\mathcal L=\frac1K\sum_{k=0}^{K-1}\big\lVert(T^{(k)}_{\mathrm{pred}}-T^{(k)}_{\mathrm{true}})/\sigma_T\big\rVert^2$.
+Con \texttt{pushforward\_steps=1} se recupera el entrenamiento clásico de un paso;
+el headline usa $K=2$. El ruido lo pone \texttt{dynamic\_temperature\_noise} (mayor
+cerca del baño, $\sim0$ en el campo lejano):
+
+\srcref{src/training/utils.py — dynamic\_temperature\_noise, l.385--389}
+\begin{lstlisting}
+sigma = beta * (T - T_inf).abs() + floor       # grande cerca de la fusion, ~0 lejos
+eta = torch.randn(T.shape, ...) * sigma
+return T + eta
+\end{lstlisting}
+
+\begin{idea}[La línea más importante de todo el entrenamiento]
+\texttt{T\_hat = T\_pred} \emph{sin} \texttt{detach}. Si pusieras \texttt{.detach()}
+ahí, cada paso entrenaría aislado (teacher forcing) y volverías al objetivo de un
+paso, que \emph{no} está alineado con el rollout largo. No hacer detach es lo que
+propaga el gradiente a través de los $K$ pasos (BPTT) y alinea el entrenamiento con
+la inferencia. Esa única ausencia de \texttt{detach} \emph{es} el push-forward.
+\end{idea}
+
+\subsection{Validación = rollout autoregresivo (no un paso)}
+
+La métrica que selecciona el \emph{checkpoint} \textbf{no} es la pérdida de un paso:
+es el RMSE de un \textbf{rollout autoregresivo completo} sobre las simulaciones de
+validación (el modelo despliega toda la trayectoria realimentándose). Por eso vive
+en \texttt{rollout.py} y se invoca así:
+
+\srcref{src/training/train.py — \_validate\_rollout, l.333--340}
+\begin{lstlisting}
+for name, result in val_results.items():
+    rollout = run_autoregressive_rollout(model, result, normalizer, device=device)
+    per_sim[name] = rollout.rmse
+per_sim["mean"] = float(np.mean(list(per_sim.values())))
+\end{lstlisting}
+
+\subsection{El bucle exterior: optimizador, \emph{scheduler}, \emph{checkpoints}}
+
+El resto de \texttt{train()} es PyTorch ``de toda la vida'', con detalles pensados
+para \emph{pods} que se pueden cortar: \texttt{AdamW} (lr $10^{-3}$, weight decay
+$10^{-4}$), \emph{scheduler} configurable (\texttt{plateau} en el headline),
+guardado \textbf{atómico} de \texttt{best\_model.pt} (mejor métrica) y
+\texttt{last\_model.pt} (estado completo para \texttt{--resume}). El guardado atómico
+(temp $+$ \texttt{os.replace}) evita dejar un checkpoint a medias si el pod muere.
+
+\srcref{src/training/train.py — selección de mejor y guardado, l.490--505 (abreviado)}
+\begin{lstlisting}
+improved = metric < best_metric - cfg.early_stop_min_delta
+if improved:
+    best_metric = metric; best_epoch = epoch; epochs_since_improve = 0
+    _atomic_save({"model_state": model.state_dict(), "config": asdict(cfg),
+                  "epoch": epoch, "metric": best_metric, ...}, ckpt_dir / "best_model.pt")
+\end{lstlisting}
+
+%==============================================================================
+\section{Inferencia: el rollout autoregresivo en detalle}
+\label{sec:rollout}
+%==============================================================================
+
+En inferencia el modelo recibe \textbf{solo} el campo inicial $T^0$ y la trayectoria
+Goldak (conocida). Como la trayectoria es determinista, \textbf{todas las features
+dependientes del tiempo se precalculan} para todos los pasos con el mismo
+\texttt{build\_graph\_sequence} del entrenamiento (paridad total). En el bucle se
+\textbf{sobrescribe solo la columna de temperatura} con la predicción que se va
+acumulando:
+
+\srcref{src/training/rollout.py — run\_autoregressive\_rollout, l.188--212 (abreviado)}
+\begin{lstlisting}
+graphs = build_graph_sequence(result, sim_id=sim_id)     # MISMO builder que en train
+feats = torch.stack([g.x for g in graphs]).to(device)    # (S-1, N, 12) precomputado
+edge_index = graphs[0].edge_index; edge_attr = graphs[0].edge_attr   # topologia fija
+
+T_cur = gt[0].clone()                                    # arranca de la T^0 verdadera
+for t in range(n_steps):
+    x = feats[t].clone(); x[:, TEMPERATURE_INDEX] = T_cur    # sobrescribe SOLO la T
+    x_norm = x.clone(); x_norm[:, mask] = (x[:, mask] - nt.x_mean[mask]) / nt.x_std[mask]
+    dT = nt.inverse_y(model(x_norm, edge_index, edge_attr)).squeeze(-1)
+    T_cur = T_cur + dT                                       # autoregresivo
+    history.append(T_cur.clone())
+\end{lstlisting}
+
+\dummies{Inferencia $=$ ``dame $T^0$ y te doy toda la película''. La red predice
+$\Delta T$, lo suma, y vuelve a meter esa $T$ como entrada del paso siguiente.
+Solo la temperatura se realimenta; el arco y la geometría ya se conocen. Es
+\emph{idéntico} al bucle interno del push-forward, pero sin gradiente y para los
+$\sim$1500 pasos completos.}
+
+\begin{idea}[El mismo bucle, dos usos]
+El \emph{feed-forward} ``sobrescribe T $\rightarrow$ normaliza $\rightarrow$ modelo
+$\rightarrow$ \texttt{inverse\_y} $\rightarrow$ $T{+}{=}\Delta T$'' aparece
+\textbf{dos veces}, idéntico: en \texttt{rollout.py} (inferencia, \texttt{no\_grad},
+$\sim$1500 pasos) y dentro de \texttt{\_train\_one\_epoch} (entrenamiento,
+diferenciable, $K$ pasos). Esa simetría es la que alinea objetivo y despliegue.
+\end{idea}
+
+%==============================================================================
+\section{Cómo responder (casi) cualquier pregunta del repo}
+\label{sec:faq}
+%==============================================================================
+
+Con el mapa de §\ref{sec:mapa} y las traducciones ecuación$\leftrightarrow$código,
+estas preguntas típicas se responden ``de memoria'':
+
+\begin{description}[leftmargin=0em,style=nextline]
+\item[``¿Dónde se garantiza la conservación de energía?'']
+En la suma cero por columnas de la Laplaciana:
+\texttt{scatter(w*(mu[dst]-mu[src]), dst, "sum")} (meshgraphnet.py l.611). No hay
+penalización; es identidad algebraica.
+\item[``¿Dónde está el calor latente?'']
+En \texttt{MaterialProperties.cp\_apparent} (thermal\_solver.py l.93), tabulado a
+\texttt{H\_grid} en el \texttt{\_\_init\_\_} del head (meshgraphnet.py l.553), y
+aplicado al invertir con \texttt{\_interp1d} (l.635).
+\item[``¿Por qué la red no usa coordenadas?'']
+Porque \texttt{NODE\_FEATURE\_NAMES} (graph\_builder.py l.48) solo tiene features
+relativas; \texttt{pos} se guarda aparte (l.257) y nunca entra en \texttt{x}.
+\item[``¿Qué hace exactamente $K=2$?'']
+Desenrolla 2 pasos realimentando la predicción \emph{sin} \texttt{detach}
+(train.py l.303) y promedia el MSE escalado (l.302,304).
+\item[``¿Por qué el head trabaja en kelvin si la red está normalizada?'']
+Porque guarda las constantes en \emph{buffers} y des-normaliza con \texttt{\_phys\_col}
+(meshgraphnet.py l.338); se cargan con \texttt{set\_normalization} (train.py l.421).
+\item[``¿Cómo se elige el mejor modelo?'']
+Por el RMSE de \textbf{rollout} de validación, no por la loss de un paso
+(train.py l.466--505); \texttt{best\_model.pt} guarda ese mínimo.
+\item[``¿Por qué el decoder a veces no existe?'']
+En modo \texttt{full}/\texttt{enthalpy} el incremento sale de las latentes
+(estructura GENERIC), así que el decoder se pone a \texttt{None} (meshgraphnet.py
+l.669--670) y el forward enruta por el head (l.720).
+\end{description}
+
+%==============================================================================
+\section{Recapitulación: ecuación $\rightarrow$ archivo $\rightarrow$ línea}
+\label{sec:resumen}
+%==============================================================================
+
+\renewcommand{\arraystretch}{1.25}
+\noindent\small
+\begin{tabular}{@{}p{0.36\linewidth}p{0.60\linewidth}@{}}
+\toprule
+Concepto / ecuación & Implementación (archivo · líneas) \\
+\midrule
+12 features de nodo, target $\Delta T$ & \texttt{graph\_builder.py} · l.48--73, 246--260 \\
+Encoder $\bm v^{(0)},\bm\epsilon^{(0)}$ & \texttt{meshgraphnet.py} · Encoder l.170--173 \\
+Paso de mensajes (update + scatter + residual) & \texttt{meshgraphnet.py} · GraphNetBlock l.209--224 \\
+Enrutado del head / decoder puenteado & \texttt{meshgraphnet.py} · l.669--670, 708--732 \\
+Normalización z-score, \texttt{inverse\_y} & \texttt{graph\_builder.py} · l.282--292 \\
+Head en kelvin (buffers, \texttt{\_phys\_col}) & \texttt{meshgraphnet.py} · l.304--343 \\
+Conductancias $w_{ij}\ge0$ simétricas & \texttt{meshgraphnet.py} · l.596--604 \\
+$(\Lw\mu)_i$ vía \texttt{scatter} (1er principio) & \texttt{meshgraphnet.py} · l.606--612 \\
+$\cpapp$ (campanas de calor latente) & \texttt{thermal\_solver.py} · l.93--101 \\
+Tabla $H(T)$ en kelvin (reescalado) & \texttt{meshgraphnet.py} · l.546--555 \\
+Interp. diferenciable $H\leftrightarrow T$ & \texttt{meshgraphnet.py} · \_interp1d l.497--502 \\
+Update entálpico $T{=}H^{-1}(H{+}\Delta H)$ & \texttt{meshgraphnet.py} · l.633--640 \\
+Fuente enriquecida (zero-init, softplus, gate) & \texttt{meshgraphnet.py} · l.569--575, 625--629 \\
+Split por simulación & \texttt{utils.py} · l.180--188 \\
+Ventanas $K$ + collate alineado & \texttt{utils.py} · l.425--454 \\
+Ruido dinámico & \texttt{utils.py} · l.385--389 \\
+Push-forward $K$ + pérdida (BPTT) & \texttt{train.py} · l.286--309 \\
+Validación por rollout & \texttt{train.py} · l.333--340 ; \texttt{rollout.py} · l.188--212 \\
+Best/last checkpoint atómico, resume & \texttt{train.py} · l.324--329, 441--523 \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+\begin{idea}[La moraleja de implementación]
+La formulación se traduce en \textbf{tres patrones de código} que reconocerás en
+todas partes: (1) \texttt{scatter} sobre aristas $=$ ``operador de grafo'' (paso de
+mensajes \emph{y} Laplaciana GENERIC); (2) dos \texttt{\_interp1d} contra las tablas
+\texttt{T\_grid}/\texttt{H\_grid} $=$ ``el calor latente y la conversión
+$T\leftrightarrow H$''; (3) el bucle ``sobrescribe T $\rightarrow$ modelo
+$\rightarrow$ $T{+}{=}\Delta T$'', con gradiente ($K$ pasos) en entrenamiento y sin
+él ($\sim$1500) en inferencia. Si entiendes esos tres patrones, entiendes el repo.
+\end{idea}
+
+\end{document}

@@ -1,0 +1,978 @@
+%==============================================================================
+%  GENERIC entálpico PARA DUMMIES
+%  Explicación ab-initio, ecuación a ecuación, del modelo de soldadura,
+%  el modelo FEM, la entalpía, las c_p, y la formulación GENERIC en entalpía.
+%
+%  Requisito de partida del lector: solo el 1er y 2do principio de la
+%  termodinámica. NO se asume soldadura, ecuación del calor, FEM ni termo
+%  avanzada.
+%==============================================================================
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{siunitx}
+\sisetup{output-decimal-marker={.}}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+% --- macros -------------------------------------------------------------------
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\grad}{\nabla}
+\newcommand{\Tinf}{T_{\infty}}
+\newcommand{\cpapp}{c_p^{\mathrm{app}}}
+\newcommand{\cpsens}{c_p^{\mathrm{sens}}}
+\newcommand{\Lw}{\bm{L}_{w}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\abs}[1]{\left\lvert#1\right\rvert}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\alert}[1]{\textcolor{red}{\textbf{#1}}}
+
+% --- cajas pedagógicas (entornos tipo teorema, siempre disponibles) -----------
+\theoremstyle{definition}
+\newtheorem{definicion}{Definición}[section]
+\newtheorem{idea}{Idea clave}[section]
+\newtheorem{ejemplo}{Ejemplo}[section]
+\theoremstyle{plain}
+\newtheorem{proposicion}{Proposición}[section]
+
+% caja de aviso "para dummies"
+\newcommand{\dummies}[1]{%
+  \par\smallskip\noindent
+  \colorbox{yellow!18}{\parbox{\dimexpr\linewidth-2\fboxsep}{%
+  \small\textbf{En cristiano:} #1}}\par\smallskip}
+
+\title{\bfseries GENERIC entálpico \emph{para dummies}\\[4pt]
+  \large De la soldadura y el calor a una red neuronal que respeta\\
+  el primer y el segundo principio, ecuación a ecuación}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Este documento explica, \textbf{desde cero}, la formulación matemática que hay
+detrás del modelo de soldadura del proyecto. La única herramienta previa que se
+supone es el \textbf{primer y el segundo principio de la termodinámica}. A partir
+de ahí construimos, paso a paso y ecuación a ecuación: (1)~qué pasa físicamente al
+soldar; (2)~qué es el calor específico $c_p$ y por qué la \emph{entalpía} es la
+variable correcta; (3)~la ecuación del calor, deducida de un balance de energía;
+(4)~qué es el método de los elementos finitos (FEM) y por qué lo necesitamos;
+(5)~qué es GENERIC y cómo garantiza los dos principios \emph{por construcción};
+(6)~por qué imponer GENERIC sobre la \emph{temperatura} está mal cuando hay cambio
+de fase, y (7)~cómo se arregla pasándolo a \emph{entalpía}. Cada símbolo se define
+la primera vez que aparece. Las cajas amarillas resumen ``en cristiano'' lo que
+cada bloque significa.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==============================================================================
+\section{Antes de empezar: lo único que damos por sabido}
+%==============================================================================
+
+Vamos a apoyarnos solo en dos frases. Todo lo demás se construye encima.
+
+\begin{idea}[Primer principio: la energía ni se crea ni se destruye]
+La energía de un sistema solo cambia si \emph{entra} o \emph{sale} energía a través
+de su frontera. No aparece de la nada ni desaparece. Si nadie aporta ni quita
+energía, la energía total es constante.
+\end{idea}
+
+\begin{idea}[Segundo principio: el desorden (entropía) no disminuye solo]
+Existe una magnitud llamada \emph{entropía} $S$ que mide, en cierto sentido, el
+``desorden'' o la irreversibilidad. En un sistema aislado la entropía
+\textbf{nunca decrece}: $\dd S/\dd t \ge 0$. Una consecuencia cotidiana: el calor
+fluye \textbf{espontáneamente de lo caliente a lo frío}, nunca al revés por sí
+solo.
+\end{idea}
+
+Necesitaremos además una relación cuantitativa entre energía, calor y entropía que
+se deduce de estos principios y que es la \emph{bisagra} de todo el documento. La
+introducimos ya, y la justificamos en la Sección~\ref{sec:bisagra}:
+\begin{equation}
+  \boxed{\;\dd S = \frac{\dd E}{T}\;}
+  \qquad\Longleftrightarrow\qquad
+  \frac{\partial S}{\partial E} = \frac{1}{T}.
+  \label{eq:bisagra}
+\end{equation}
+Aquí $E$ es la energía (en julios, $\mathrm{J}$), $T$ la temperatura absoluta (en
+kelvin, $\mathrm{K}$) y $S$ la entropía ($\mathrm{J/K}$).
+
+\dummies{Si a un cuerpo le metes una pizca de energía $\dd E$ estando a temperatura
+$T$, su entropía sube en $\dd E/T$. Cuanto más caliente está, menos entropía gana
+por el mismo julio. Esta fórmula es \emph{toda} la termodinámica que usaremos.}
+
+%==============================================================================
+\section{El problema físico: ¿qué pasa cuando soldamos?}
+\label{sec:soldadura}
+%==============================================================================
+
+Imagina una \textbf{placa metálica} plana (acero), como una baldosa de metal.
+Por encima pasa un \textbf{arco eléctrico} (la ``antorcha'' de soldadura) que se
+mueve siguiendo un camino. El arco es una fuente de calor muy concentrada y muy
+intensa: deposita energía en una zona pequeña que va recorriendo la placa.
+
+Lo que ocurre, en orden:
+\begin{enumerate}[leftmargin=1.5em]
+  \item Justo bajo el arco el metal se calienta muchísimo, se \textbf{funde}
+  (forma un ``charco'' o \emph{baño} de fusión) e incluso puede empezar a
+  \textbf{hervir}/vaporizarse en el punto más caliente.
+  \item El calor se \textbf{difunde} hacia el metal frío de alrededor: la zona
+  caliente se ensancha como una mancha que se va suavizando.
+  \item Cuando el arco se aleja, esa zona se \textbf{enfría}: cede calor al resto
+  de la placa y al aire (convección y radiación).
+\end{enumerate}
+
+Lo que queremos predecir es el \textbf{campo de temperatura} $T(\bm x,t)$: la
+temperatura en cada punto $\bm x$ de la placa y en cada instante $t$. Saber esto es
+clave en ingeniería porque de ahí salen las tensiones residuales, las deformaciones
+y la microestructura del material.
+
+\dummies{Soldar $=$ pasear una fuente de calor brutal por una placa. El metal se
+funde donde pasa y se enfría detrás. Queremos un mapa de temperaturas en cada
+instante.}
+
+\paragraph{¿Por qué es difícil?} Por dos motivos que dan nombre a casi todo lo que
+sigue:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Cambio de fase.} Fundir y hervir \emph{absorben} mucha energía
+  \textbf{sin que suba la temperatura} (luego veremos por qué). El metal no se
+  comporta como ``más energía $=$ más temperatura''.
+  \item \textbf{Hay que avanzar en el tiempo muchísimos pasos.} La solución se
+  calcula instante a instante; los errores se pueden ir acumulando.
+\end{itemize}
+
+%==============================================================================
+\section{Energía, calor específico y por qué nace la entalpía}
+\label{sec:cp}
+%==============================================================================
+
+\subsection{Calor específico: cuánta energía cuesta calentar}
+
+\begin{definicion}[Calor específico $c_p$]
+El \emph{calor específico} $c_p$ es la energía que hay que dar a $1\,\mathrm{kg}$ de
+material para subir su temperatura $1\,\mathrm{K}$. Unidades:
+$\mathrm{J\,kg^{-1}\,K^{-1}}$.
+\end{definicion}
+
+Para el acero, lejos de cambios de fase, $c_p \approx \SI{600}{J\,kg^{-1}\,K^{-1}}$.
+Es decir, calentar un kilo de acero un grado cuesta unos 600 julios.
+
+Si tengo una masa $m$ y le subo la temperatura de $T_0$ a $T$, la energía que he
+metido (suponiendo $c_p$ constante) es
+\begin{equation}
+  E = m\,c_p\,(T-T_0).
+  \label{eq:Esimple}
+\end{equation}
+Si $c_p$ \emph{no} es constante (depende de $T$), hay que sumar pizca a pizca, es
+decir integrar:
+\begin{equation}
+  E = m\int_{T_0}^{T} c_p(\tau)\,\dd\tau .
+  \label{eq:Eint}
+\end{equation}
+
+\dummies{$c_p$ es el ``precio en julios'' de subir un grado un kilo. La energía
+almacenada es ese precio multiplicado por los grados que has subido (y si el precio
+cambia con la temperatura, integras).}
+
+Como trabajamos con campos (energía \emph{por unidad de volumen}) en vez de masas
+sueltas, usamos la \textbf{densidad} $\rho$ (en $\mathrm{kg/m^3}$; para el acero
+$\rho=\SI{7850}{kg/m^3}$). La masa de un trocito de volumen $V$ es $m=\rho V$, así
+que la energía por unidad de volumen es $E/V = \rho\int c_p\,\dd T$.
+
+\subsection{El calor latente: energía que entra y la temperatura no se mueve}
+
+Aquí está la rareza de la soldadura. Cuando el metal \textbf{funde}, los átomos
+rompen los enlaces del sólido para volverse líquido. Eso \emph{cuesta energía},
+pero esa energía se gasta en romper enlaces, \textbf{no en subir la temperatura}.
+Resultado: puedes estar metiendo calor a saco y el termómetro se queda clavado en
+la temperatura de fusión hasta que todo el trocito se ha fundido. Lo mismo, aún más
+exagerado, al hervir.
+
+\begin{definicion}[Calor latente]
+El \emph{calor latente} de fusión $L_f$ (y el de vaporización $L_v$) es la energía
+por unidad de masa que absorbe el material al cambiar de fase \textbf{a temperatura
+casi constante}. Para el acero $L_f\approx\SI{2.7e5}{J/kg}$ y
+$L_v\approx\SI{6.3e6}{J/kg}$ (¡vaporizar cuesta más de 20 veces que fundir!).
+\end{definicion}
+
+\subsection{El truco del $c_p$ aparente}
+
+¿Cómo metemos ``energía que entra sin que suba $T$'' en una fórmula como
+\eqref{eq:Eint}, que dice ``energía $=$ integral de $c_p$''? Con un truco muy
+elegante: fingimos que, \textbf{justo en la temperatura de fusión}, el calor
+específico se dispara hacia un valor enorme. Así, para pasar de un pelín por debajo
+a un pelín por encima de $T_m$ hay que meter una barbaridad de energía
+(precisamente $L_f$), y eso es exactamente lo que pasa de verdad.
+
+Matemáticamente, ese ``pico'' se modela con una campana de Gauss estrecha centrada
+en la temperatura de fusión $T_m$, y otra en la de ebullición $T_b$. El calor
+específico \textbf{aparente} es
+\begin{equation}
+  \cpapp(T) \;=\; \underbrace{\cpsens}_{\text{normal}}
+  \;+\; L_f\,\frac{\dd f_\ell}{\dd T}
+  \;+\; L_v\,\frac{\dd f_v}{\dd T},
+  \label{eq:cpapp}
+\end{equation}
+donde $\cpsens$ es el calor específico ``sensible'' (el normal, $\approx 600$),
+y las dos campanas son
+\begin{equation}
+  \frac{\dd f_\ell}{\dd T}=\frac{1}{s_\ell\sqrt{\pi}}\,
+    e^{-\left((T-T_m)/s_\ell\right)^2},
+  \qquad
+  \frac{\dd f_v}{\dd T}=\frac{1}{s_v\sqrt{\pi}}\,
+    e^{-\left((T-T_b)/s_v\right)^2}.
+  \label{eq:bumps}
+\end{equation}
+$s_\ell$ y $s_v$ son los anchos de las campanas (lo ``repartido'' que está el
+cambio de fase en temperatura). La gracia es que \textbf{el área de cada campana
+vale $1$}, de modo que al integrar $\cpapp$ por la zona de fusión recuperamos
+exactamente $L_f$ (y por la de ebullición, $L_v$). El término de ebullición actúa
+además como un \emph{termostato físico}: la energía que si no dispararía la
+temperatura a valores absurdos ($\sim\!\SI{e4}{K}$) se la ``traga'' la campana, y
+la temperatura se queda contenida cerca del punto de ebullición.
+
+\dummies{$\cpapp$ es el $c_p$ normal \emph{más} dos chepas: una gigante en la
+temperatura de fusión y otra en la de ebullición. Esas chepas representan la
+energía que el cambio de fase se traga sin subir la temperatura. El área de cada
+chepa es justo el calor latente.}
+
+\subsection{La entalpía: la energía almacenada, de verdad}
+\label{sec:entalpia}
+
+Ahora juntamos todo. La energía por unidad de volumen almacenada en el metal,
+\emph{contando ya el calor latente}, al ir de una temperatura de referencia $T_0$
+hasta $T$, es la integral del $c_p$ aparente. A esa cantidad la llamamos
+\textbf{entalpía volumétrica}:
+\begin{equation}
+  \boxed{\;h(T) \;=\; \rho \int_{T_0}^{T} \cpapp(\tau)\,\dd\tau\;}
+  \qquad [\,\mathrm{J/m^3}\,].
+  \label{eq:enthalpy}
+\end{equation}
+
+\begin{idea}[El papel central de la entalpía]
+$h(T)$ es la \textbf{cantidad de energía guardada por unidad de volumen}. Es la
+magnitud que \emph{de verdad} se conserva y se transporta. La temperatura $T$ es
+solo una \emph{etiqueta} que leemos a partir de la energía.
+\end{idea}
+
+¿Qué forma tiene la curva $h(T)$? (Figura~\ref{fig:hcurve}.)
+\begin{itemize}[leftmargin=1.5em]
+  \item Lejos de los cambios de fase, $\cpapp\approx\cpsens$ es casi constante, así
+  que $h(T)\approx \rho\,\cpsens\,(T-T_0)$: una recta. Más energía $\to$ más
+  temperatura, proporcional.
+  \item En la fusión y la ebullición, $\cpapp$ se dispara (las campanas), así que
+  la curva $h(T)$ se vuelve casi \textbf{vertical}: metes mucha energía ($h$ sube
+  mucho) y la temperatura apenas se mueve. Son las \emph{mesetas} de cambio de
+  fase.
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.9\linewidth}{\centering\small
+\textit{Curva entalpía--temperatura $h(T)$ (esquema).}\\[6pt]
+\ttfamily
+\begin{tabular}{l}
+ $h$ (energía)\\[2pt]
+ \textbar\hfill \_\_\_\_/ \ \ $\leftarrow$ meseta de ebullición ($L_v$)\\
+ \textbar\hfill /\\
+ \textbar\hfill \_\_\_\_/ \ \ $\leftarrow$ meseta de fusión ($L_f$, a $T\!\approx\!T_m$)\\
+ \textbar\ \ \ \ \ \_\_\_\_\_\_/\\
+ \textbar\ \_/ \ \ (pendiente $\rho c_p$ fuera del cambio de fase)\\
+ +\rule{5cm}{0.4pt}$>$\ \ $T$ (temperatura)\\
+\end{tabular}}}
+\caption{La relación entalpía--temperatura. En las mesetas, un gran aumento de
+energía $h$ produce un aumento casi nulo de temperatura $T$: el cambio de fase se
+``come'' la energía. Esta no-linealidad es la protagonista de todo el documento.}
+\label{fig:hcurve}
+\end{figure}
+
+Como $\cpapp>0$ siempre, $h(T)$ es \textbf{estrictamente creciente}: a cada
+temperatura le corresponde una entalpía y viceversa. Por eso la podemos
+\textbf{invertir}: dada la energía almacenada $h$, recuperamos la temperatura con
+\begin{equation}
+  \boxed{\;T = h^{-1}(h).\;}
+  \label{eq:hinv}
+\end{equation}
+Esto es lo que en física se llama el \emph{método de la entalpía}: lleva la cuenta
+en energía, y traduce a temperatura solo al final.
+
+\dummies{La entalpía $h$ es ``cuánta energía hay guardada aquí''. Su gráfica contra
+la temperatura es una rampa con dos rellanos planos (fundir y hervir). Como sube
+siempre, puedes ir de $h$ a $T$ o de $T$ a $h$ sin ambigüedad: $T=h^{-1}(h)$.}
+
+%==============================================================================
+\section{La ecuación del calor, deducida de un balance de energía}
+\label{sec:calor}
+%==============================================================================
+
+Hasta ahora hablamos de un trocito de metal. Ahora queremos una ecuación para
+\emph{todo} el campo $T(\bm x,t)$. La obtenemos aplicando el primer principio a un
+volumen diminuto y dejándolo encogerse.
+
+\subsection{Dos ingredientes}
+
+\paragraph{(a) ¿Cómo viaja el calor? Ley de Fourier.} La experiencia dice que el
+calor fluye de lo caliente a lo frío, y más deprisa cuanto más brusco es el cambio
+de temperatura. Eso se escribe con el \emph{flujo de calor} $\bm q$ (energía que
+cruza una superficie por unidad de área y tiempo, $\mathrm{W/m^2}$):
+\begin{equation}
+  \bm q = -\,k\,\grad T.
+  \label{eq:fourier}
+\end{equation}
+Aquí $k$ es la \textbf{conductividad térmica} ($\mathrm{W\,m^{-1}\,K^{-1}}$; para
+el acero $k\approx 30$) y $\grad T$ es el \textbf{gradiente} de temperatura: un
+vector que apunta hacia donde $T$ crece más rápido. El signo menos dice ``el calor
+va en sentido contrario al gradiente'', es decir, \textbf{hacia donde hace más
+frío}. Esto es el segundo principio en versión local.
+
+\paragraph{(b) Balance de energía.} Tomemos una cajita de volumen $\dd V$. El
+primer principio dice: \emph{el ritmo al que aumenta su energía $=$ lo que entra
+neto por las paredes $+$ lo que genera la fuente interna}. ``Lo que entra neto por
+las paredes'' es menos la divergencia del flujo, $-\grad\!\cdot\!\bm q$ (la
+divergencia mide cuánto ``sale''); y la fuente interna (el arco) la llamamos $Q$
+(potencia por unidad de volumen, $\mathrm{W/m^3}$). La energía por volumen es la
+entalpía $h$, cuyo ritmo de cambio es $\partial h/\partial t$. Entonces:
+\begin{equation}
+  \frac{\partial h}{\partial t} = -\,\grad\!\cdot\!\bm q \;+\; Q.
+  \label{eq:balance}
+\end{equation}
+
+\subsection{Juntando los ingredientes}
+
+Sustituimos Fourier \eqref{eq:fourier} en el balance \eqref{eq:balance}:
+\begin{equation}
+  \frac{\partial h}{\partial t} = \grad\!\cdot\!\big(k\,\grad T\big) + Q.
+  \label{eq:heath}
+\end{equation}
+Y ahora usamos la entalpía \eqref{eq:enthalpy}. Por la regla de la cadena,
+$\partial h/\partial t = \dfrac{\dd h}{\dd T}\dfrac{\partial T}{\partial t}
+= \rho\,\cpapp(T)\,\dfrac{\partial T}{\partial t}$ (recuerda
+$\dd h/\dd T = \rho\,\cpapp$). Sustituyendo obtenemos la forma clásica de la
+\textbf{ecuación del calor}:
+\begin{equation}
+  \boxed{\;\rho\,\cpapp(T)\,\frac{\partial T}{\partial t}
+    = \grad\!\cdot\!\big(k(T)\,\grad T\big) + Q(\bm x,t).\;}
+  \label{eq:heat}
+\end{equation}
+
+\dummies{Esta ecuación solo dice ``el primer principio en cada punto'': lo que se
+calienta un trocito ($\rho\cpapp\,\partial T/\partial t$) es igual a lo que le llega
+por conducción de los vecinos ($\grad\!\cdot\!(k\grad T)$) más lo que le mete el
+arco ($Q$). Fíjate que escrita en $T$ aparece el factor $\rho\cpapp$ delante; esto
+será importantísimo más adelante.}
+
+\subsection{La fuente del arco (Goldak) y las fronteras}
+
+La fuente $Q$ del arco se modela con una distribución que se usa estándar en
+soldadura, la \textbf{doble elipsoide de Goldak}: una ``mancha'' de calor con forma
+de dos medios-balones (uno delante y otro detrás del punto de la antorcha) que se
+mueve con ella. No hace falta su fórmula exacta para entender el resto; basta saber
+que $Q(\bm x,t)$ es \textbf{grande y concentrada cerca de la antorcha} y cero lejos
+(y cero del todo cuando el arco se apaga en la fase de enfriamiento).
+
+En los \textbf{bordes} de la placa hay que decir qué pasa con el calor. Tres
+opciones (condiciones de contorno):
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Dirichlet:} el borde se mantiene a una temperatura fija $T=T_D$
+  (como si estuviera pegado a algo que no se calienta).
+  \item \textbf{Convección:} el borde cede calor al aire a su alrededor, a un ritmo
+  $h_{\mathrm{conv}}(T-\Tinf)$, donde $\Tinf$ es la temperatura ambiente y
+  $h_{\mathrm{conv}}$ un coeficiente de intercambio.
+  \item \textbf{Radiación:} el borde irradia calor, a un ritmo
+  $\varepsilon\,\sigma_{\mathrm{SB}}(T^4-\Tinf^4)$, con $\varepsilon$ la emisividad
+  y $\sigma_{\mathrm{SB}}$ la constante de Stefan--Boltzmann.
+\end{itemize}
+Convección $+$ radiación juntas se llaman condición de \emph{Robin}. No nos
+detenemos más: lo que importa es que \textbf{hay un baño térmico} (el ambiente) al
+que la placa tiende, y que la temperatura nunca debería bajar de ese ambiente solo
+enfriándose (esto será una prueba de cordura más adelante).
+
+%==============================================================================
+\section{El método de los elementos finitos (FEM), sin misterio}
+\label{sec:fem}
+%==============================================================================
+
+\subsection{El problema y la idea}
+
+La ecuación \eqref{eq:heat} es una ecuación en derivadas parciales: nos pide $T$ en
+\emph{infinitos} puntos de una placa de forma cualquiera. No sabemos resolverla con
+lápiz y papel salvo en casos triviales. El FEM es la receta para resolverla
+\textbf{de forma aproximada en un ordenador}.
+
+\begin{idea}[La idea del FEM en una frase]
+En vez de buscar la temperatura en infinitos puntos, partimos la placa en muchos
+\textbf{triangulitos} (los \emph{elementos}), guardamos la temperatura solo en sus
+\textbf{vértices} (los \emph{nodos}), y suponemos que dentro de cada triángulo la
+temperatura varía de forma sencilla (lineal). Así, el campo continuo se reduce a
+una \textbf{lista finita de números} $\bm T = (T_1,\dots,T_N)$: la temperatura en
+cada nodo.
+\end{idea}
+
+A esa partición en triángulos se la llama \textbf{malla}. Aproximamos
+\begin{equation}
+  T(\bm x,t) \approx \sum_{i=1}^{N} T_i(t)\,\phi_i(\bm x),
+  \label{eq:interp}
+\end{equation}
+donde $\phi_i(\bm x)$ son las \emph{funciones de forma}: $\phi_i$ vale $1$ en el
+nodo $i$, $0$ en los demás nodos, y varía linealmente entre medias. Cada $T_i(t)$ es
+la temperatura del nodo $i$ en el instante $t$, lo que queremos calcular.
+
+\subsection{De la PDE a un sistema de ecuaciones}
+
+Si metes la aproximación \eqref{eq:interp} en la ecuación del calor
+\eqref{eq:heat} y haces el procedimiento estándar del FEM (multiplicar por una
+función de prueba e integrar sobre la placa; los detalles no son necesarios aquí),
+la ecuación en derivadas parciales se convierte en un \textbf{sistema de ecuaciones
+diferenciales ordinarias} para la lista de temperaturas $\bm T(t)$:
+\begin{equation}
+  \bm M(\bm T)\,\dot{\bm T} \;+\; \bm A(\bm T)\,\bm T \;=\; \bm b(t).
+  \label{eq:semidisc}
+\end{equation}
+Vamos pieza a pieza:
+\begin{itemize}[leftmargin=1.5em]
+  \item $\dot{\bm T}=\dd\bm T/\dd t$ es la velocidad de cambio de las temperaturas
+  nodales.
+  \item $\bm M$ es la \textbf{matriz de masa} (o de capacidad térmica). Recoge el
+  término $\rho\,\cpapp$: cuánto cuesta calentar. Depende de $\bm T$ porque
+  $\cpapp$ depende de $T$ (¡el calor latente!).
+  \item $\bm A=\bm K+\bm R$ es la \textbf{matriz de rigidez}: $\bm K$ viene de la
+  conducción ($k\grad T$) y $\bm R$ de las fronteras (convección/radiación).
+  \item $\bm b(t)$ es el \textbf{vector de cargas}: la energía que mete el arco
+  (Goldak) más lo que entra/sale por los bordes.
+\end{itemize}
+
+\dummies{El FEM convierte ``resuelve esta ecuación en toda la placa'' en
+``resuelve este sistema de ecuaciones con una temperatura por nodo''. Las matrices
+$\bm M$ (calentar cuesta) y $\bm A$ (el calor se reparte y se escapa por los
+bordes) son solo la contabilidad de la energía nodo a nodo.}
+
+\subsection{Avanzar en el tiempo}
+
+\eqref{eq:semidisc} dice cómo cambian las temperaturas, pero queremos pasar del
+instante $n$ al $n+1$. Discretizamos el tiempo en pasos $\Delta t$ y usamos un
+esquema implícito (Euler hacia atrás), que es estable:
+\begin{equation}
+  \Big(\tfrac{1}{\Delta t}\bm M + \bm A\Big)\bm T^{\,n+1}
+  = \tfrac{1}{\Delta t}\bm M\,\bm T^{\,n} + \bm b^{\,n+1}.
+  \label{eq:beuler}
+\end{equation}
+Esto es un sistema lineal $\bm{\mathcal A}\,\bm T^{n+1}=\bm c$ que el ordenador
+resuelve en cada paso. Pero hay una pega: $\bm M$ y $\bm A$ \emph{dependen} de la
+$\bm T^{n+1}$ que aún no conocemos (porque $\cpapp(T)$ y la radiación $T^4$ son
+no-lineales). Se arregla \textbf{iterando}: adivino $\bm T^{n+1}$, recalculo
+$\bm M,\bm A$, resuelvo, y repito hasta que deja de cambiar. Eso es la
+\emph{iteración de Picard}.
+
+El resultado del FEM es una \textbf{película}: una secuencia de fotogramas
+$\bm T^0,\bm T^1,\bm T^2,\dots$ con la temperatura de cada nodo en cada instante.
+Esta es nuestra ``verdad de referencia'' (\emph{ground truth}) cara de calcular:
+puede tardar minutos u horas. El objetivo del proyecto es \textbf{aprender un
+sustituto rápido} (una red neuronal sobre la malla) que imite esta película. Cómo
+se aprende ese sustituto es otra historia; aquí nos centramos en \textbf{qué física
+y qué garantías} le imponemos.
+
+%==============================================================================
+\section{GENERIC desde cero: meter los dos principios en la dinámica}
+\label{sec:generic}
+%==============================================================================
+
+\subsection{La bisagra energía--entropía--temperatura}
+\label{sec:bisagra}
+
+Recuperemos la relación \eqref{eq:bisagra} y justifiquémosla. El segundo principio
+introduce la entropía con $\dd S = \delta Q_{\mathrm{rev}}/T$. Si a un trocito de
+material, sin que haga trabajo, le añadimos calor $\delta Q$, toda esa energía se
+queda como energía interna: $\dd E = \delta Q$. Por tanto
+\begin{equation}
+  \dd S = \frac{\dd E}{T}
+  \qquad\Longrightarrow\qquad
+  \frac{\partial S}{\partial E} = \frac{1}{T}.
+  \label{eq:mu}
+\end{equation}
+A la derivada $\partial S/\partial E$ la llamaremos $\mu$ (la ``fuerza
+termodinámica''):
+\begin{equation}
+  \mu \;\equiv\; \frac{\partial S}{\partial E} \;=\; \frac{1}{T}.
+  \label{eq:mudef}
+\end{equation}
+
+\begin{idea}[Lo único que hay que recordar de aquí]
+La derivada de la entropía respecto de la energía es $1/T$. Esto vale
+\textbf{siempre}, con o sin calor latente, sea cual sea $c_p$, porque sale
+directamente de la definición de entropía. Es robusto como una roca.
+\end{idea}
+
+\subsection{La estructura GENERIC}
+
+GENERIC (siglas en inglés de ``Ecuación General para el Acoplamiento
+No-Equilibrio Reversible--Irreversible'') es una \textbf{plantilla} para escribir
+cómo evoluciona un sistema de manera que \emph{automáticamente} cumpla los dos
+principios. La idea: todo proceso tiene una parte \textbf{reversible} (sin
+pérdidas, como un péndulo ideal) y una parte \textbf{irreversible} (con pérdidas,
+como el rozamiento que genera calor). GENERIC las separa y las controla.
+
+Sea $\bm z$ el \textbf{estado} del sistema (la lista de variables que lo
+describen). GENERIC postula:
+\begin{equation}
+  \boxed{\;
+  \frac{\dd \bm z}{\dd t}
+  = \underbrace{\bm L\,\frac{\partial E}{\partial \bm z}}_{\text{reversible}}
+  + \underbrace{\bm M\,\frac{\partial S}{\partial \bm z}}_{\text{irreversible}}
+  \;}
+  \label{eq:generic}
+\end{equation}
+con dos ``motores'': la energía total $E(\bm z)$ y la entropía total $S(\bm z)$.
+Las derivadas $\partial E/\partial\bm z$ y $\partial S/\partial\bm z$ son los
+gradientes (las ``pendientes'') de esos potenciales. Las matrices $\bm L$ y $\bm M$
+deben cumplir:
+\begin{itemize}[leftmargin=1.5em]
+  \item $\bm L$ es \textbf{antisimétrica}: $\bm L^{\mathsf T}=-\bm L$. (La parte
+  reversible.)
+  \item $\bm M$ es \textbf{simétrica y semidefinida positiva} (SPSD):
+  $\bm M^{\mathsf T}=\bm M$ y $\bm x^{\mathsf T}\bm M\bm x\ge 0$ para todo $\bm x$.
+  (La parte irreversible.)
+  \item \textbf{Condiciones de degeneración:}
+  \begin{equation}
+    \bm L\,\frac{\partial S}{\partial \bm z}=\bm 0,
+    \qquad
+    \bm M\,\frac{\partial E}{\partial \bm z}=\bm 0.
+    \label{eq:degen}
+  \end{equation}
+  En palabras: la parte reversible \emph{no toca la entropía}, y la parte
+  irreversible \emph{no toca la energía}.
+\end{itemize}
+
+\subsection{El milagro: los dos principios salen solos}
+
+Veamos que \eqref{eq:generic}--\eqref{eq:degen} garantizan los principios.
+
+\paragraph{Primer principio ($\dd E/\dd t = 0$ si nadie aporta energía).} La
+energía cambia según la regla de la cadena, $\dd E/\dd t = (\partial
+E/\partial\bm z)^{\mathsf T}\,\dd\bm z/\dd t$. Sustituyendo \eqref{eq:generic}:
+\begin{equation}
+  \frac{\dd E}{\dd t}
+  = \Big(\tfrac{\partial E}{\partial\bm z}\Big)^{\!\mathsf T}\bm L\,
+    \tfrac{\partial E}{\partial\bm z}
+  + \Big(\tfrac{\partial E}{\partial\bm z}\Big)^{\!\mathsf T}\bm M\,
+    \tfrac{\partial S}{\partial\bm z}.
+\end{equation}
+El primer término es \textbf{cero} porque $\bm L$ es antisimétrica (para cualquier
+vector $\bm a$, $\bm a^{\mathsf T}\bm L\bm a=0$: un número igual a su propio
+negativo solo puede ser $0$). El segundo término es \textbf{cero} por la
+degeneración $\bm M\,\partial E/\partial\bm z=\bm 0$. Total: $\dd E/\dd t=0$.
+
+\paragraph{Segundo principio ($\dd S/\dd t \ge 0$).} Igual con la entropía:
+\begin{equation}
+  \frac{\dd S}{\dd t}
+  = \Big(\tfrac{\partial S}{\partial\bm z}\Big)^{\!\mathsf T}\bm L\,
+    \tfrac{\partial E}{\partial\bm z}
+  + \Big(\tfrac{\partial S}{\partial\bm z}\Big)^{\!\mathsf T}\bm M\,
+    \tfrac{\partial S}{\partial\bm z}.
+\end{equation}
+El primer término es \textbf{cero} por la degeneración $\bm L\,\partial
+S/\partial\bm z=\bm 0$. El segundo es \textbf{$\ge 0$} porque $\bm M$ es
+semidefinida positiva (eso significa exactamente que $\bm a^{\mathsf T}\bm M\bm
+a\ge0$). Total: $\dd S/\dd t\ge0$.
+
+\begin{idea}[Por qué nos encanta GENERIC]
+Si construyes la dinámica con esta plantilla, \textbf{es imposible} que viole el
+primer o el segundo principio, \emph{pase lo que pase} con los detalles. La energía
+se conserva y la entropía no decrece \emph{por construcción}, no por suerte ni por
+entrenar bien. Para una red neuronal que da millones de pasos, esto es oro: las
+garantías no dependen de cuántos pasos des.
+\end{idea}
+
+\subsection{Nuestro caso: conducción pura y sistema abierto}
+
+La conducción de calor \textbf{no tiene parte reversible} (no hay un ``flujo de
+calor que vaya y vuelva sin pérdidas''): es puro rozamiento térmico. Por tanto
+$\bm L=\bm 0$ y nos quedamos solo con la parte irreversible:
+\begin{equation}
+  \frac{\dd\bm z}{\dd t} = \bm M\,\frac{\partial S}{\partial\bm z}.
+  \label{eq:diss}
+\end{equation}
+
+Una sutileza honesta: la placa que soldamos \textbf{no} está aislada: el arco le
+mete energía y los bordes la dejan escapar. La identidad $\dd E/\dd t=0$ vale para
+un sistema \emph{aislado}. La solución estándar (extensión de GENERIC a sistemas
+abiertos) es: la estructura SPSD gobierna solo la \textbf{evolución interna} (la
+conducción entre nodos), y el intercambio con el exterior (arco $+$ bordes) se añade
+como un término aparte $\bm f^{\mathrm{ext}}$ que \emph{no} está obligado a
+conservar energía (¡faltaría más, si es justo el que la mete o la saca!):
+\begin{equation}
+  \frac{\dd\bm z}{\dd t}
+  = \underbrace{\bm M\,\frac{\partial S}{\partial\bm z}}_{\text{interno: conserva energía, } \dd S\ge0}
+  \;+\; \underbrace{\bm f^{\mathrm{ext}}}_{\text{arco + bordes}}.
+  \label{eq:open}
+\end{equation}
+Así, la energía interna se conserva exactamente y la energía total cambia
+\emph{justo} en lo que entra por el arco o sale por los bordes, que es lo que la
+física pide.
+
+%==============================================================================
+\section{El error de usar la temperatura como estado}
+\label{sec:error}
+%==============================================================================
+
+Llega el momento clave del documento. Tenemos la plantilla \eqref{eq:diss}. Falta
+decidir \textbf{cuál es el estado $\bm z$}. La tentación natural es:
+\textbf{``pues la temperatura, $\bm z=\bm T$''}. Vamos a ver que eso está
+\emph{mal} en cuanto hay calor latente.
+
+\subsection{Cómo conectamos los nodos: el grafo de conductancias}
+
+Antes, necesitamos darle forma a $\bm M$ en una malla. Pensamos los nodos como un
+\textbf{grafo}: cada nodo está unido a sus vecinos por aristas. A cada arista
+$i\!-\!j$ le asignamos una \textbf{conductancia} $w_{ij}\ge 0$ (cómo de bien pasa el
+calor por ahí), simétrica $w_{ij}=w_{ji}$. Con eso se construye la matriz
+\textbf{Laplaciana} del grafo,
+\begin{equation}
+  \Lw = \bm D - \bm W,\qquad
+  \bm W=[w_{ij}],\quad \bm D=\mathrm{diag}\Big(\textstyle\sum_j w_{ij}\Big).
+  \label{eq:laplacian}
+\end{equation}
+Esta $\Lw$ tiene dos propiedades que vienen como anillo al dedo:
+\begin{enumerate}[leftmargin=1.5em]
+  \item Es \textbf{SPSD} (simétrica y $\ge 0$), justo lo que GENERIC pide para
+  $\bm M$.
+  \item \textbf{Suma cero por filas}: $\Lw\bm 1=\bm 0$ (donde $\bm 1$ es el vector
+  de unos). Esto va a ser \emph{exactamente} la condición de degeneración
+  $\bm M\,\partial E/\partial\bm z=\bm0$.
+\end{enumerate}
+Aplicada a un vector $\bmu$ de ``fuerzas'' nodales, la Laplaciana da, en cada nodo,
+\begin{equation}
+  (\Lw\bmu)_i = \sum_{j\sim i} w_{ij}\,(\mu_i-\mu_j),
+  \label{eq:lapaction}
+\end{equation}
+es decir, la suma de las diferencias con los vecinos, ponderadas por la
+conductancia. (El símbolo $j\sim i$ significa ``$j$ vecino de $i$''.)
+
+\subsection{La tentación (y por qué falla)}
+
+Tomemos $\bm z=\bm T$ y, copiando \eqref{eq:diss}, escribamos directamente el
+incremento de temperatura como
+\begin{equation}
+  \Delta T_i = (\Lw\bmu)_i,\qquad \mu_i=\frac{1}{T_i}.
+  \label{eq:wrong}
+\end{equation}
+Sumando sobre todos los nodos, como $\Lw$ suma cero por filas,
+\begin{equation}
+  \sum_i \Delta T_i = \bm 1^{\mathsf T}\Lw\bmu = 0.
+  \label{eq:sumT}
+\end{equation}
+``¡Bien, la suma de temperaturas se conserva, esto conserva la energía!'' \alert{Mal.}
+Conservar $\sum_i T_i$ \textbf{no es} conservar la energía. La energía de un nodo no
+es su temperatura: es su entalpía. El cambio de energía del nodo $i$ es
+$\Delta e_i = \rho\,\cpapp(T_i)\,\Delta T_i$ (recuerda $\dd h=\rho\cpapp\,\dd T$).
+Por tanto la \emph{verdadera} conservación de energía sería
+\begin{equation}
+  \sum_i \Delta e_i = \sum_i \rho\,\cpapp(T_i)\,\Delta T_i = 0,
+  \label{eq:energytrue}
+\end{equation}
+y esto \textbf{no} coincide con \eqref{eq:sumT} salvo que $\cpapp$ sea el mismo en
+todos los nodos. Las dos sumas se diferencian justo en el factor $\cpapp(T_i)$,
+\textbf{que se dispara en el baño de fusión}.
+
+\begin{equation}
+  \underbrace{\sum_i \Delta T_i = 0}_{\text{suma de temperaturas}}
+  \;\;\neq\;\;
+  \underbrace{\sum_i \rho\,\cpapp(T_i)\,\Delta T_i = 0}_{\text{energía (lo correcto)}}.
+  \label{eq:wrongcons}
+\end{equation}
+
+\begin{ejemplo}[Dos nodos, para verlo con números]
+Nodo $A$ en plena fusión, con $\cpapp$ enorme (digamos $20$ veces el normal por la
+campana de $L_f$); nodo $B$ frío, con $\cpapp$ normal. La dinámica correcta mueve
+una cierta energía $\Delta e$ de $A$ a $B$: $\Delta e_A=-\Delta e$,
+$\Delta e_B=+\Delta e$, y \textbf{la energía se conserva} ($\Delta e_A+\Delta e_B=0$).
+Traducido a temperaturas: $\Delta T_A=\Delta e_A/(\rho\,(\cpapp)_A V)$ es
+\emph{minúsculo} (el $(\cpapp)_A$ enorme en el denominador), mientras que
+$\Delta T_B=\Delta e_B/(\rho\,(\cpapp)_B V)$ es $20$ veces mayor. ¡La suma
+$\Delta T_A+\Delta T_B\neq0$! Si en cambio \emph{forzaras} $\sum\Delta T=0$ como en
+\eqref{eq:wrong}, estarías moviendo mal la energía: enfriarías $A$ de más
+(le restarías mucha más temperatura de la que la física permite, porque ignoras que
+ahí cada grado cuesta $20$ veces más).
+\end{ejemplo}
+
+Físicamente, \eqref{eq:energytrue} reescrita como
+\begin{equation}
+  \frac{\dd T_i}{\dd t} = \frac{1}{\rho\,\cpapp(T_i)}\,\frac{\dd e_i}{\dd t}
+  \label{eq:correctT}
+\end{equation}
+dice que \textbf{en el baño de fusión $\dd T/\dd t$ debe ser pequeño} (toda la
+energía que llega se la traga el cambio de fase). La versión ingenua
+\eqref{eq:wrong} \emph{no tiene} ese freno $1/(\rho\cpapp)$ y por eso
+\textbf{mueve de más los nodos calientes}: achata o deforma el pico de temperatura.
+Esto explica lo que se observaba experimentalmente: el modelo con estructura sobre
+$T$ ``capaba'' el pico de fusión.
+
+\dummies{Conservar la \emph{suma de temperaturas} no es conservar la \emph{energía},
+porque cada grado vale distinto según dónde estés en la curva $h(T)$ (en la fusión,
+un grado cuesta un montón de julios). Imponer GENERIC sobre $T$ comete justo este
+error, y se nota más donde más nos importa: en el charco de fusión.}
+
+%==============================================================================
+\section{La solución: GENERIC entálpico}
+\label{sec:enthalpic}
+%==============================================================================
+
+El arreglo es de cajón una vez visto el problema: \textbf{que el estado sea la
+energía, no la temperatura}. Es el ``método de la entalpía'' de toda la vida,
+metido dentro de GENERIC.
+
+\subsection{Estado, potenciales y los dos principios}
+
+Tomamos como estado la \textbf{energía nodal} (extensiva, en julios):
+\begin{equation}
+  z_i = \mathcal E_i = h_i\,V_i,
+  \label{eq:state}
+\end{equation}
+donde $h_i=h(T_i)$ es la entalpía volumétrica del nodo \eqref{eq:enthalpy} y $V_i$
+es el ``volumen tributario'' del nodo (el cachito de placa que le corresponde). La
+energía total es la suma, $E=\sum_i\mathcal E_i$, así que su gradiente es
+trivial:
+\begin{equation}
+  \frac{\partial E}{\partial\mathcal E_i}=1
+  \qquad\Longrightarrow\qquad
+  \frac{\partial E}{\partial\bm z}=\bm 1 .
+  \label{eq:gradE}
+\end{equation}
+¡Mira qué bonito! La condición de degeneración $\bm M\,\partial E/\partial\bm z=\bm0$
+se vuelve $\Lw\bm 1=\bm 0$, que la Laplaciana \textbf{cumple exactamente} por
+construcción (suma cero por filas). La energía se conservará \emph{en cualquier
+malla}.
+
+El gradiente de la entropía respecto de la energía es nuestra vieja amiga la
+bisagra \eqref{eq:mudef}: $\mu_i=\partial S/\partial\mathcal E_i=1/T_i$. Con
+$\bm M=\Lw$, la evolución \eqref{eq:diss} se concreta en:
+\begin{equation}
+  \boxed{\;
+  \frac{\dd\mathcal E_i}{\dd t} = (\Lw\bmu)_i
+  = \sum_{j\sim i} w_{ij}\Big(\frac{1}{T_i}-\frac{1}{T_j}\Big),
+  \qquad
+  T_i = h^{-1}\!\big(\mathcal E_i/V_i\big).
+  \;}
+  \label{eq:enthevol}
+\end{equation}
+
+Leamos esta ecuación despacio, que es \emph{la} ecuación del documento:
+\begin{itemize}[leftmargin=1.5em]
+  \item La parte izquierda es ``cómo cambia la energía del nodo $i$''.
+  \item La derecha suma, sobre los vecinos, las diferencias de $\mu=1/T$. Si el
+  nodo $i$ está \textbf{más caliente} que su vecino ($T_i>T_j\Rightarrow 1/T_i <
+  1/T_j$), el término $(1/T_i-1/T_j)$ es \textbf{negativo}: el nodo caliente
+  \textbf{pierde} energía. ¡El calor va de caliente a frío \emph{por
+  construcción}, segundo principio en acción!
+  \item Lo que pierde $i$ lo gana $j$ exactamente (la arista aporta $+$ a uno y $-$
+  al otro). Energía conservada.
+  \item Al final, traducimos energía a temperatura con $T_i=h^{-1}(\mathcal
+  E_i/V_i)$. \textbf{Aquí entra gratis el calor latente:} en la meseta de fusión
+  $h^{-1}$ es casi plano, así que un gran $\Delta\mathcal E$ produce un
+  $\Delta T$ minúsculo, \emph{igual que en el FEM}. El freno $1/(\rho\cpapp)$ que le
+  faltaba a la versión sobre $T$ \textbf{aparece solo} al invertir la curva.
+\end{itemize}
+
+\begin{proposicion}[Los dos principios, en cualquier malla]
+\label{prop:laws}
+Para cualesquiera conductancias simétricas no negativas $w_{ij}=w_{ji}\ge0$, la
+evolución \eqref{eq:enthevol} cumple, en cada grafo,
+\begin{equation}
+  \frac{\dd E}{\dd t}=\sum_i\frac{\dd\mathcal E_i}{\dd t}
+  = \bm 1^{\mathsf T}\Lw\bmu = 0
+  \quad(\text{1.\textsuperscript{er} principio}),
+\end{equation}
+\begin{equation}
+  \frac{\dd S}{\dd t}=\bmu^{\mathsf T}\Lw\bmu
+  = \tfrac12\sum_{i,j} w_{ij}(\mu_i-\mu_j)^2 \ge 0
+  \quad(\text{2.\textsuperscript{o} principio}).
+\end{equation}
+\end{proposicion}
+\begin{proof}
+La conservación de energía sale de $\bm 1^{\mathsf T}\Lw=\bm 0$ (suma cero por
+columnas). Para la entropía, la identidad
+$\bmu^{\mathsf T}\Lw\bmu=\tfrac12\sum_{i,j}w_{ij}(\mu_i-\mu_j)^2$ es la forma
+cuadrática estándar de la Laplaciana, y es $\ge0$ porque cada $w_{ij}\ge0$ y cada
+término va al cuadrado. (Esto es justo decir que $\Lw$ es SPSD.)
+\end{proof}
+
+\dummies{Cambiando el estado de ``temperatura'' a ``energía'', la \emph{misma}
+plantilla GENERIC ahora sí conserva la energía de verdad (no la suma de
+temperaturas) y produce entropía $\ge0$, y encima trata el calor latente exacto al
+invertir la curva $h(T)$. Es el método de la entalpía clásico, escrito como una
+Laplaciana de grafo.}
+
+\subsection{Comprobación: ¿esto es de verdad la conducción de Fourier?}
+
+Conviene verificar que \eqref{eq:enthevol} no es un invento, sino la conducción de
+siempre disfrazada. Usando $\grad T=-T^2\,\grad(1/T)=-T^2\grad\mu$, el flujo de
+Fourier \eqref{eq:fourier} se escribe $\bm q=-k\grad T=k\,T^2\,\grad\mu$.
+Discretizado en el grafo, $\grad\!\cdot\!\bm q$ da \emph{exactamente} la forma
+$\Lw\bmu$ con conductancias $w_{ij}\sim k\,T_iT_j/\ell_{ij}^2$ (siendo $\ell_{ij}$
+la distancia entre nodos). O sea: la ecuación \eqref{eq:enthevol} \textbf{es} la
+ley de Fourier; lo único que la red neuronal tiene que aprender son esas
+conductancias $w_{ij}$ (que dependen de la temperatura y de la geometría).
+
+%==============================================================================
+\section{Dos detalles que hacen que funcione de verdad}
+\label{sec:detalles}
+%==============================================================================
+
+\subsection{Acondicionamiento numérico: la entalpía en ``unidades de kelvin''}
+
+Un problema práctico: la entalpía volumétrica es un número \emph{enorme},
+$h\sim\SI{e9}{J/m^3}$. Su inversa tiene pendiente $\partial T/\partial h =
+1/(\rho\cpapp)\sim\SI{2e-7}{}$, un número diminuto. Cuando entrenas la red, ese
+factor minúsculo multiplica todos los gradientes que vuelven hacia las
+conductancias, y los hunde por debajo del umbral numérico del optimizador
+($\varepsilon\sim\SI{e-8}{}$ en Adam): el entrenamiento \textbf{se atasca} (la
+pérdida se congela y la difusión nunca aprende).
+
+La solución es trabajar con una entalpía \textbf{re-escalada a unidades de
+temperatura} (kelvin), dividiendo por $\rho\cpsens$:
+\begin{equation}
+  H(T) \;=\; \frac{h(T)}{\rho\,\cpsens}
+  \;=\; \int_{T_0}^{T}\frac{\cpapp(\tau)}{\cpsens}\,\dd\tau .
+  \label{eq:Heq}
+\end{equation}
+Fuera del cambio de fase $H\approx T-T_0$ (pendiente $1$, ``casi temperatura'');
+en las mesetas la pendiente se dispara igual que antes. Como esto es solo
+\textbf{multiplicar por una constante}, la conservación de energía no cambia
+($\sum_i\Delta H_i=0\Leftrightarrow\sum_i\Delta h_i=0$), pero ahora los incrementos
+son de orden ``grados'' y los gradientes de orden $1$. Con este único cambio, los
+gradientes pasaron de $\sim\!\SI{e-13}{}$ a $\sim\!\SI{e-4}{}$ y el entrenamiento se
+desatascó desde la primera época.
+
+\dummies{La entalpía en julios es un numerón que rompe el entrenamiento. La
+dividimos por $\rho\cpsens$ para medirla en ``grados equivalentes''. Es solo un
+cambio de unidades: no toca la física, pero arregla los números.}
+
+\subsection{La fuente enriquecida: por qué la disipación sola no basta}
+
+Hay un detalle físico importante. La parte disipativa \eqref{eq:enthevol}
+\textbf{solo puede enfriar} el nodo más caliente (el calor va de caliente a frío,
+siempre). Entonces, ¿quién \emph{calienta} el pico del baño de fusión? Solo la
+\textbf{fuente externa} (el arco). Con una única ganancia escalar, esa fuente era
+demasiado rígida para inyectar suficiente energía en el pico, y los modelos con
+estructura salían ``fríos'' en el punto más caliente.
+
+La clave es que la fuente y los bordes son el término \emph{no conservativo}
+$\bm f^{\mathrm{ext}}$ de \eqref{eq:open}, que GENERIC \textbf{no obliga} a
+conservar energía. Por tanto le podemos dar más flexibilidad \emph{sin romper
+ninguna garantía}. Sustituimos la ganancia escalar por una modulación aprendida
+nodo a nodo:
+\begin{equation}
+  \Delta H_i^{\mathrm{ext}}
+  = \underbrace{\mathrm{softplus}\!\big(g_q+\mathrm{MLP}_q(\cdots)\big)\,q_i}
+    _{\text{calentamiento del arco }\ge 0}
+  + \underbrace{\mathrm{softplus}\!\big(g_c+\mathrm{MLP}_c(\cdots)\big)\,r_i\,(\Tinf-T_i)}
+    _{\text{enfriamiento de Newton en bordes }r_i}.
+  \label{eq:enriched}
+\end{equation}
+Aquí $q_i$ es el valor de la fuente Goldak en el nodo, $r_i$ marca si el nodo está
+en un borde con convección, $\mathrm{MLP}$ es una pequeña red neuronal, y
+$\mathrm{softplus}(\cdot)\ge0$ garantiza que el arco solo \emph{calienta} (nunca
+inventa frío). Además está ``gateado'' por $q_i$: donde no hay arco ($q_i=0$), no
+puede meter energía de la nada. Las redes salen inicializadas a cero, así que el
+modelo \textbf{empieza igual} que la versión con ganancia escalar y luego aprende
+dónde inyectar más.
+
+Lo esencial: \textbf{la disipación \eqref{eq:enthevol} sigue intacta y
+estructura-preservante}; solo el término externo, que de todas formas no estaba
+sujeto a las garantías, se vuelve flexible. Conservación de energía interna y
+$\dd S/\dd t\ge0$ se mantienen palabra por palabra.
+
+\dummies{La parte ``con garantías'' solo sabe enfriar. Para recalentar el charco
+hace falta el arco. Como el arco es energía que entra de fuera (no está obligado a
+conservar nada), le dejamos ser flexible sin estropear los principios.}
+
+%==============================================================================
+\section{Recapitulación: el camino completo en una página}
+\label{sec:resumen}
+%==============================================================================
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{Física.} Soldar mueve una fuente de calor brutal por una placa; el
+  metal funde y se enfría. Queremos el campo $T(\bm x,t)$.
+  \item \textbf{Energía.} Calentar cuesta $c_p$ por grado. El cambio de fase se
+  traga calor latente sin subir $T$ $\Rightarrow$ lo modelamos con un $\cpapp$ con
+  dos campanas \eqref{eq:cpapp}.
+  \item \textbf{Entalpía.} La energía almacenada es $h(T)=\rho\int\cpapp\,\dd T$
+  \eqref{eq:enthalpy}: una rampa con dos rellanos. Es invertible: $T=h^{-1}(h)$.
+  Es la magnitud que de verdad se conserva.
+  \item \textbf{Ecuación del calor.} Balance de energía $+$ Fourier $\Rightarrow$
+  $\rho\cpapp\,\partial_t T=\grad\!\cdot\!(k\grad T)+Q$ \eqref{eq:heat}.
+  \item \textbf{FEM.} Partimos la placa en triángulos, una temperatura por nodo, y
+  la PDE se vuelve un sistema $\bm M\dot{\bm T}+\bm A\bm T=\bm b$ que avanzamos en
+  el tiempo. Es la verdad de referencia cara.
+  \item \textbf{GENERIC.} Plantilla $\dot{\bm z}=\bm L\,\partial_z E+\bm
+  M\,\partial_z S$ con $\bm L$ antisimétrica, $\bm M$ SPSD y degeneraciones
+  $\Rightarrow$ primer y segundo principio \emph{por construcción}
+  \eqref{eq:generic}--\eqref{eq:degen}.
+  \item \textbf{El error.} Con estado $=$ temperatura, $\sum\Delta T=0$ \emph{no es}
+  conservar energía cuando hay calor latente \eqref{eq:wrongcons}; achata el pico.
+  \item \textbf{La cura.} Estado $=$ energía $\mathcal E_i=h_iV_i$. La misma
+  Laplaciana de conductancias conserva energía de verdad, produce entropía, y trata
+  el latente exacto al hacer $T=h^{-1}$ \eqref{eq:enthevol}, Prop.~\ref{prop:laws}.
+  \item \textbf{Detalles.} Re-escalar a $H=h/(\rho\cpsens)$ para que entrene
+  \eqref{eq:Heq}; fuente externa flexible \eqref{eq:enriched} para recalentar el
+  pico sin romper las garantías.
+\end{enumerate}
+
+\begin{idea}[La moraleja, en una frase]
+Impón la estructura termodinámica sobre la \textbf{energía} (entalpía), nunca sobre
+la temperatura: bajo calor latente, conservar la suma de temperaturas no es
+conservar la energía, y el desajuste es máximo justo en el baño de fusión, que es
+lo que más nos importa.
+\end{idea}
+
+%==============================================================================
+\appendix
+\section{Glosario de símbolos}
+%==============================================================================
+
+\renewcommand{\arraystretch}{1.25}
+\noindent
+\begin{tabular}{@{}p{0.20\linewidth}p{0.74\linewidth}@{}}
+\toprule
+Símbolo & Significado \\
+\midrule
+$T,\ \Tinf$        & temperatura (K); temperatura ambiente \\
+$\rho$             & densidad ($\mathrm{kg/m^3}$); acero $7850$ \\
+$\cpsens$          & calor específico ``normal'' (sensible), $\approx 600\ \mathrm{J\,kg^{-1}K^{-1}}$ \\
+$\cpapp(T)$        & calor específico aparente: $\cpsens$ + campanas de calor latente \eqref{eq:cpapp} \\
+$L_f,\ L_v$        & calor latente de fusión y de vaporización (J/kg) \\
+$T_m,\ T_b$        & temperatura de fusión y de ebullición (K) \\
+$k$                & conductividad térmica ($\mathrm{W\,m^{-1}K^{-1}}$); acero $\approx 30$ \\
+$h(T)$             & entalpía volumétrica $=\rho\int\cpapp\,\dd T$ ($\mathrm{J/m^3}$), energía almacenada \\
+$H(T)$             & entalpía re-escalada a kelvin, $h/(\rho\cpsens)$ \eqref{eq:Heq} \\
+$\bm q$            & flujo de calor ($\mathrm{W/m^2}$); Fourier $\bm q=-k\grad T$ \\
+$Q$                & fuente volumétrica del arco ($\mathrm{W/m^3}$), Goldak \\
+$\grad,\ \grad\!\cdot$ & gradiente y divergencia \\
+$\bm T$            & lista de temperaturas nodales $(T_1,\dots,T_N)$ \\
+$\bm M,\bm A,\bm b$ & matrices de masa, rigidez y vector de cargas del FEM \eqref{eq:semidisc} \\
+$\bm z$            & estado del sistema en GENERIC \\
+$E,\ S$            & energía total y entropía total (potenciales de GENERIC) \\
+$\mu_i=1/T_i$      & fuerza termodinámica, $\partial S/\partial\mathcal E$ \eqref{eq:mudef} \\
+$\bm L,\ \bm M$    & operador reversible (antisimétrico) e irreversible (SPSD) \\
+$w_{ij}$           & conductancia de la arista $i\!-\!j$ ($\ge0$, simétrica) \\
+$\Lw=\bm D-\bm W$  & Laplaciana de grafo (hace de $\bm M$); SPSD y $\Lw\bm1=\bm0$ \\
+$\mathcal E_i=h_iV_i$ & energía nodal (estado en la versión entálpica) \\
+$V_i$              & volumen tributario del nodo $i$ \\
+$\bm f^{\mathrm{ext}}$ & término externo no conservativo (arco + bordes) \\
+\bottomrule
+\end{tabular}
+
+\end{document}

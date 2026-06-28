@@ -35,6 +35,16 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# LaTeX build artifacts (docs/ .tex + .pdf ARE committed; these are regenerable)
+*.aux
+*.toc
+*.out
+*.nav
+*.snm
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
 # Project data artifacts (generated FEM datasets, graphs, checkpoints, logs)
 data/raw/
 data/processed/

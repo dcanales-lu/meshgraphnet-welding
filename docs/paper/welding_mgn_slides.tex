@@ -1,0 +1,362 @@
+%==============================================================================
+%  Congress slides (10-15 min) for:
+%  A Thermodynamically-Consistent MeshGraphNet Surrogate for Transient
+%  Welding Heat Transfer
+%
+%  Beamer, Madrid theme, blue, 16:9. Self-contained; figures expected next to
+%  this .tex (already copied into docs/paper/):
+%     spiral_pf_best_ep60_thermal_history.png
+%     ablation_figure.png
+%     compare_val_sim001_fem_on_off.png
+%==============================================================================
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}        % Madrid default structure colour is blue
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{caption}[numbered]
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage{graphicx}
+
+\graphicspath{{./}{./figs/}}
+
+% --- macros (match the paper) -------------------------------------------------
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\T}{\mathsf{T}}
+\newcommand{\grad}{\nabla}
+\newcommand{\Lw}{\bm{L}_{\!w}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\cpapp}{c_p^{\mathrm{app}}}
+\newcommand{\Tinf}{T_{\infty}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\abs}[1]{\left\lvert#1\right\rvert}
+
+% slightly tighter blocks
+\setbeamersize{text margin left=1.2em,text margin right=1.2em}
+
+\title[Thermo-Consistent MeshGraphNet for Welding]{%
+  A Thermodynamically-Consistent MeshGraphNet Surrogate\\
+  for Transient Welding Heat Transfer}
+\subtitle{Enthalpy-State GENERIC Structure and Push-Forward Training}
+\author[]{[Author(s)]}
+\institute[]{[Affiliation]}
+\date{Congress on Numerical Methods, 2026}
+
+\begin{document}
+
+%------------------------------------------------------------------ 1. title
+\begin{frame}[plain]
+  \titlepage
+\end{frame}
+
+%------------------------------------------------------------------ 2. motivation
+\begin{frame}{Motivation: a fast, \emph{trustworthy} welding surrogate}
+  Arc welding $\Rightarrow$ a moving, localized source driving melting and
+  partial vaporization; steep transient gradients set residual stress and
+  distortion.
+  \medskip\pause
+
+  High-fidelity transient nonlinear FEM is the standard tool but costs
+  \textbf{minutes to hours per run} $\Rightarrow$ design exploration / UQ /
+  control are prohibitive.
+  \medskip\pause
+
+  A learned \emph{MeshGraphNet} surrogate is attractive, but two issues are
+  acute for welding:
+  \begin{enumerate}
+    \item<4-> \textbf{Long-horizon stability} --- autoregressive error
+      accumulates; a model accurate on short rollouts can diverge
+      (far-field heating, sub-ambient cooling, runaway).
+    \item<5-> \textbf{Phase-change physics} --- energy storage is dominated by
+      \emph{latent heat}: energy $\not\propto$ temperature exactly where it
+      matters (the melt pool).
+  \end{enumerate}
+  \onslide<6->{\centering\smallskip
+    \structure{\small Goal: a surrogate that is \emph{thermodynamically
+    consistent by construction}.}}
+\end{frame}
+
+%------------------------------------------------------------------ 3. physics + data
+\begin{frame}{Governing physics and the FEM ground truth}
+  Thickness-integrated transient heat conduction with a moving Goldak
+  double-ellipsoid source:
+  \begin{equation*}
+    \rho\,\cpapp(T)\,\frac{\partial T}{\partial t}
+      = \grad\!\cdot\!\big(k(T)\,\grad T\big) + Q(\bm x,t),
+  \end{equation*}
+  $P_1$ triangles, $\theta$-method (backward Euler) + Picard for the
+  nonlinearity; mixed Robin (convection\,+\,radiation) / Dirichlet boundaries.
+  \medskip\pause
+
+  \textbf{Latent heat} folded into an \emph{apparent} heat capacity
+  $\Rightarrow$ volumetric enthalpy
+  \begin{equation*}
+    h(T)=\rho\!\int_{T_0}^{T}\!\cpapp(\tau)\,\dd\tau,
+    \qquad \frac{\dd h}{\dd T}=\rho\,\cpapp(T)\ \text{spikes at melting/boiling.}
+  \end{equation*}
+  \pause
+
+  \textbf{Dataset.} \num{360} simulations (\num{398597} graph pairs); every axis
+  covered (size, power, speed, BCs) \emph{except trajectory topology}, which is
+  held out $\Rightarrow$ generalization is cleanly attributable to the path.
+\end{frame}
+
+%------------------------------------------------------------------ 4. MPNN backbone
+\begin{frame}{The backbone: an Encoder--Processor--Decoder MeshGraphNet}
+  Each snapshot pair $(T^t,T^{t+1})$ is a graph; target is the increment
+  $\bm y = T^{t+1}-T^{t}$.
+  \medskip\pause
+
+  \textbf{Relative features only} (no absolute coordinates $\Rightarrow$ learns
+  local physics, generalizes across meshes):
+  \begin{itemize}
+    \item Nodes (12-d): $T$, Goldak feature, co-moving torch coords, process
+      scalars, boundary one-hots and values.
+    \item Edges (3-d): displacement $[\Delta x,\Delta y,\lVert\bm u_{ij}\rVert]$.
+  \end{itemize}
+  \medskip\pause
+
+  $L{=}8$ message-passing blocks, width $d{=}128$, residual updates
+  ($\approx$\,\num{1.29}\,M params). Autoregressive rollout overwrites only the
+  temperature column with the running prediction.
+  \medskip\pause
+
+  \structure{\small Accurate --- but unconstrained, it can violate physics over
+  long rollouts. We make the increment structure-preserving.}
+\end{frame}
+
+%------------------------------------------------------------------ 5. GENERIC + inconsistency (KEY)
+\begin{frame}{Key insight: GENERIC on \emph{temperature} is inconsistent}
+  GENERIC writes $\dot{\bm z}=\bm L\,\partial_{\bm z}E+\bm M\,\partial_{\bm z}S$,
+  with $\bm L^\T=-\bm L$, $\bm M$ SPSD, degeneracies
+  $\bm L\,\partial_{\bm z}S=\bm M\,\partial_{\bm z}E=\bm 0$
+  $\Rightarrow\ \dot E=0,\ \dot S\ge0$.
+  Heat conduction is purely dissipative ($\bm L=\bm0$).
+  \medskip\pause
+
+  \alert{Tempting but wrong:} take $\bm z=\bm T$ and set
+  $\Delta T_i=(\Lw\bmu)_i$, $\mu_i=1/T_i$. Then $\sum_i\Delta T_i=0$ --- but
+  \begin{equation*}
+    \underbrace{\textstyle\sum_i \Delta T_i = 0}_{\text{temperature sum}}
+    \;\neq\;
+    \underbrace{\textstyle\sum_i \rho\,\cpapp(T_i)\,\Delta T_i
+      = \sum_i \Delta e_i = 0}_{\text{energy (1st law)}} .
+  \end{equation*}
+  \pause
+  They differ by the $\cpapp(T)$ factor that \emph{blows up at the melt pool}:
+  the temperature-state head over-moves the hottest nodes and
+  caps/distorts the peak.
+  \medskip\pause
+
+  \structure{\small Fix: impose the structure on \emph{energy} --- the classical
+  enthalpy method.}
+\end{frame}
+
+%------------------------------------------------------------------ 6. enthalpy-state head
+\begin{frame}{The enthalpy-state GENERIC head}
+  Conserved state $=$ \emph{extensive} nodal energy
+  $\mathcal E_i=h_iV_i$ $\Rightarrow\ \partial E/\partial\mathcal E_i=1$, so the
+  degeneracy $\Lw\bm 1=\bm0$ holds \emph{exactly on any mesh}.
+  \medskip\pause
+
+  Learned SPSD operator $\bm M=\Lw$ from non-negative symmetric conductances
+  $w_{ij}=w_{ji}\ge0$; thermodynamic force $\mu_i=\partial S/\partial\mathcal E_i=1/T_i$:
+  \begin{equation*}
+    \boxed{\;\frac{\dd \mathcal E_i}{\dd t}=\sum_{j\sim i}w_{ij}\Big(\tfrac1{T_i}-\tfrac1{T_j}\Big),
+    \qquad T_i=h^{-1}\!\big(\mathcal E_i/V_i\big).\;}
+  \end{equation*}
+  Heat flows hot$\to$cold by construction; latent heat is exact ($T=h^{-1}$ is
+  flat on the plateau).
+  \medskip\pause
+
+  \textbf{Proposition (any mesh).} For $w_{ij}=w_{ji}\ge0$:
+  \begin{equation*}
+    \dot E=\bm1^\T\Lw\bmu=0,\qquad
+    \dot S=\bmu^\T\Lw\bmu=\tfrac12\!\sum_{i,j}w_{ij}(\mu_i-\mu_j)^2\ge0.
+  \end{equation*}
+  \pause
+  \structure{\footnotesize Open system: arc source + boundary losses enter as a
+  separate non-conservative term $\bm f^{\mathrm{ext}}$, the only part GENERIC
+  leaves unconstrained.}
+\end{frame}
+
+%------------------------------------------------------------------ 7. enriched source + conditioning
+\begin{frame}{Two enablers: enriched source \& conditioning}
+  \textbf{Why a richer source?} The dissipation can \emph{only cool} the hottest
+  node $\Rightarrow$ structure-preserving heads run \emph{cold at the peak}. Only
+  the (non-conservative) source can heat it --- and GENERIC does not constrain it.
+  \medskip\pause
+
+  Per-node learned modulation of the Goldak heating / Newton cooling,
+  \emph{zero-initialized} (starts identical to a scalar gain), $\softplus(\cdot)\ge0$,
+  gated by $q_i$ (cannot invent far-field energy):
+  \begin{equation*}
+    \Delta H_i^{\mathrm{ext}}
+    = \softplus\!\big(g_q+\mathrm{MLP}_q\big)\,q_i
+    + \softplus\!\big(g_c+\mathrm{MLP}_c\big)\,r_i(\Tinf-T_i).
+  \end{equation*}
+  Dissipation stays fully structure-preserving. \quad(\num{1375238} params.)
+  \medskip\pause
+
+  \textbf{Conditioning.} Raw $h\sim\SI{e9}{J/m^3}$ stalls Adam. Work in
+  \emph{temperature-equivalent} enthalpy $H=h/(\rho c_p)$ (units of K): a constant
+  rescale $\Rightarrow$ conservation unchanged, gradients $O(1)$, training
+  unstuck from epoch~1.
+\end{frame}
+
+%------------------------------------------------------------------ 8. push-forward training
+\begin{frame}{Aligning the objective: push-forward ($K{=}2$) training}
+  Empirical lesson (repeated across the study): pushing the \emph{single-step}
+  objective harder (lower train MSE / short-rollout val) did \emph{not} improve
+  --- sometimes worsened --- the \num{1526}-step inference rollout.
+  \medskip\pause
+
+  \textbf{Push-forward:} unroll $K$ steps and backpropagate through the whole
+  unroll (BPTT), feeding the model's own prediction back as input:
+  \begin{equation*}
+    \mathcal L=\frac1K\sum_{k=0}^{K-1}
+      \big\lVert (T^{(k)}_{\mathrm{pred}}-T^{(k)}_{\mathrm{true}})/\sigma_T\big\rVert^2,
+    \qquad \hat T\!\leftarrow\!T_{\mathrm{pred}}\ \text{(no detach).}
+  \end{equation*}
+  $K{=}1$ recovers the classic objective; $K{=}2$ makes the operator contractive
+  over two-step composition --- enough, with the structure, to align with the
+  long rollout while staying cheap.
+  \medskip\pause
+
+  \structure{\footnotesize Plus standard MeshGraphNet training noise
+  ($\sigma=\SI{5}{K}$). Headline run: A100-80GB, $\sim$\SI{15}{min}/epoch,
+  80 epochs.}
+\end{frame}
+
+%------------------------------------------------------------------ 9. OOD test setup
+\begin{frame}{Out-of-distribution probe: the Archimedean spiral}
+  \begin{columns}[T]
+    \begin{column}{0.6\textwidth}
+      A constant-speed spiral weld on a \SI{0.2}{m} plate, 3 turns,
+      \SI{10}{mm/s}, \SI{2500}{W}, $\eta=0.8$.
+      \medskip\pause
+      \begin{itemize}
+        \item Trajectory \textbf{never seen} in training (only
+          straight/diagonal/sinusoid/arc).
+        \item Plate size and speed \emph{interior} to training ranges
+          $\Rightarrow$ isolates \emph{trajectory} generalization.
+        \item \num{4225} nodes, \num{1526} steps (\SI{76.25}{s}) --- far longer
+          than any training window.
+        \item Exercises genuine \emph{re-heating}: successive arms re-heat one
+          another (multi-pass, absent from training).
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.4\textwidth}
+      \onslide<2->{%
+      \begin{block}{Why it is hard}
+        \small Longest horizon $\times$ unseen topology $\times$ multi-pass
+        physics --- the regime where unconstrained surrogates fail.
+      \end{block}}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+%------------------------------------------------------------------ 10. headline result
+\begin{frame}{Headline result: \SI{33.2}{K} over 1526 stable steps}
+  \begin{columns}[T]
+    \begin{column}{0.56\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{spiral_pf_best_ep60_thermal_history.png}
+    \end{column}
+    \begin{column}{0.44\textwidth}
+      Enriched-source enthalpy GENERIC, push-forward $K{=}2$:
+      \begin{itemize}
+        \item<2-> Spiral global RMSE \textbf{\SI{33.2}{K}} ($\sim$$2\times$
+          better than the best unconstrained model, \SI{65}{K}).
+        \item<3-> \textbf{Stable} over all \num{1526} steps --- bounded
+          $\max\abs{\mathrm{err}}$, no divergence.
+        \item<4-> \textbf{Maximum principle} respected: min $T$ within
+          $\sim$\SI{6}{K} of the floor, never sub-ambient.
+        \item<5-> Validation RMSE \emph{stable} across epochs (does not
+          degrade, unlike $K{=}1$).
+      \end{itemize}
+      \onslide<6->{\smallskip\structure{\footnotesize Remaining flaw: the
+      sharpest central peak is mildly smoothed (1713 vs \SI{1921}{K}); the
+      mid-field is nailed.}}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+%------------------------------------------------------------------ 11. ablation table
+\begin{frame}{Ablation: thermodynamic structure ON vs.\ OFF}
+  Identical models except the head --- same $K{=}2$, split, budget, noise,
+  hyperparameters $\Rightarrow$ directly comparable.
+  \medskip\pause
+
+  \begin{table}
+    \centering\small
+    \begin{tabular}{lccccc}
+      \toprule
+      Config & Params & Val.\ RMSE & Spiral & Spiral range & Min.\ $T$\\
+             &        & (K) & @best-val (K) & ep10--80 [$\sigma$] & / under. (K)\\
+      \midrule
+      \textbf{ON} (enthalpy & \multirow{2}{*}{\num{1375238}} & \multirow{2}{*}{34.5}
+        & \multirow{2}{*}{\textbf{33.2}} & \multirow{2}{*}{33--61 [3.4]}
+        & \multirow{2}{*}{287 ($-6$)}\\
+      \;GENERIC + source) & & & & &\\
+      \addlinespace[2pt]
+      \textbf{OFF} (pure MGN) & \num{1291777} & 46.9 & 58.6 & 38--111 [10.2] & 140 ($-153$)\\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \medskip\pause
+  \begin{itemize}
+    \item<3-> \textbf{Maximum principle:} OFF cools to \SIrange{140}{190}{K}
+      ($\sim$\SI{150}{K} unphysical) at \emph{every} checkpoint; ON stays at the floor.
+    \item<4-> \textbf{Variance:} ON $\sigma\!\approx\!3.4$ vs OFF
+      $\sigma\!\approx\!10.2$ ($\sim$$3\times$).
+    \item<5-> \textbf{Selectability:} for ON the best-val checkpoint \emph{is} the
+      best spiral; for OFF it is not.
+  \end{itemize}
+\end{frame}
+
+%------------------------------------------------------------------ 12. ablation figure
+\begin{frame}{Ablation, visually: accurate-but-fragile vs.\ guaranteed}
+  \centering
+  \includegraphics[width=0.86\linewidth]{ablation_figure.png}
+  \medskip\pause
+
+  \footnotesize
+  \emph{Left:} spiral RMSE vs epoch --- ON (tight band, $\star$ best-val coincides
+  with best spiral); OFF swings $\sim$$3\times$. \quad
+  \emph{Right:} min temperature --- ON at the \SI{293}{K} floor; OFF sub-ambient
+  at every checkpoint.
+\end{frame}
+
+%------------------------------------------------------------------ 13. conclusion
+\begin{frame}{Conclusion}
+  \textbf{Impose GENERIC on energy, not temperature.} Under latent heat,
+  conserving $\sum_i T_i$ is \emph{not} conserving energy --- and the mismatch is
+  largest exactly at the melt pool.
+  \medskip\pause
+  \begin{itemize}
+    \item Carry volumetric \emph{enthalpy} as the conserved state, evolve with a
+      learned SPSD graph-Laplacian, recover $T=h^{-1}$ $\Rightarrow$ 1st \& 2nd
+      laws \emph{by construction}, through phase change.
+    \item<3-> An enriched, non-conservative \emph{source} restores melt-pool peak
+      heating without breaking the guarantees.
+    \item<4-> \emph{Push-forward} $K{=}2$ aligns training with long rollouts.
+  \end{itemize}
+  \medskip\pause\pause
+  \onslide<5->{%
+  \structure{Result:} \SI{33.2}{K} on a \num{1526}-step OOD spiral, stable and
+  maximum-principle-respecting; the structure delivers \emph{low-variance,
+  selectable, physically admissible} rollouts where the unconstrained network is
+  accurate-but-fragile.}
+  \medskip\pause
+  \onslide<6->{\centering\structure{\large Thank you --- questions?}}
+\end{frame}
+
+\end{document}

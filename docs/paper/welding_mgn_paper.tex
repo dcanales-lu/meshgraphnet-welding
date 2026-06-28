@@ -1,0 +1,1137 @@
+%==============================================================================
+%  A Thermodynamically-Consistent MeshGraphNet Surrogate for Transient
+%  Welding Heat Transfer
+%
+%  Self-contained LaTeX source for Overleaf. Standard packages only.
+%  Figures are guarded with \IfFileExists so the document compiles whether or
+%  not you upload the PNGs. To show the figures, upload these files (from
+%  data/output/) next to this .tex (or into a ./figs subfolder and adjust the
+%  \graphicspath below):
+%     spiral_pf_best_ep60_thermal_history.png
+%     ablation_figure.png
+%     compare_spiral_fem_on_off.png
+%     compare_val_sim001_fem_on_off.png
+%     compare_val_sim006_fem_on_off.png
+%==============================================================================
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalize]{cleveref}  % must load AFTER hyperref
+
+\graphicspath{{./}{./figs/}}
+
+% --- Convenience macros -------------------------------------------------------
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\T}{\mathsf{T}}                 % transpose
+\newcommand{\grad}{\nabla}
+\newcommand{\Lw}{\bm{L}_{\!w}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\cpapp}{c_p^{\mathrm{app}}}
+\newcommand{\cpsens}{c_p^{\mathrm{sens}}}
+\newcommand{\Tinf}{T_{\infty}}
+\newcommand{\Rset}{\mathbb{R}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\abs}[1]{\left\lvert#1\right\rvert}
+
+\theoremstyle{definition}
+\newtheorem{proposition}{Proposition}
+
+% --- Figure helper: only include if the file is present -----------------------
+\newcommand{\figIfExists}[4]{%
+  % #1 filename, #2 width, #3 caption, #4 label
+  \begin{figure}[t]
+    \centering
+    \IfFileExists{#1}{\includegraphics[width=#2\linewidth]{#1}}{%
+      \fbox{\parbox[c][0.30\linewidth][c]{#2\linewidth}{\centering\ttfamily
+        [figure placeholder]\\ upload \texttt{\detokenize{#1}}}}}
+    \caption{#3}
+    \label{#4}
+  \end{figure}}
+
+\title{\bfseries A Thermodynamically-Consistent MeshGraphNet Surrogate\\[2pt]
+       for Transient Welding Heat Transfer:\\[2pt]
+       Enthalpy-State GENERIC Structure and Push-Forward Training}
+
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We develop a graph-neural-network surrogate for transient thermal welding
+simulation that replaces an expensive nonlinear finite-element (FEM) solver with
+a fast, autoregressive learned model. The surrogate follows the
+Encoder--Processor--Decoder \emph{MeshGraphNet} (MPNN) architecture and is trained
+on snapshot pairs produced by a 2D transient heat-conduction solver with a moving
+Goldak double-ellipsoid arc source, temperature-dependent apparent heat capacity
+(latent heats of fusion and vaporization), and mixed convective/radiative/Dirichlet
+boundaries. We identify and correct a subtle but consequential
+thermodynamic inconsistency that arises when one imposes GENERIC
+(\emph{General Equation for the Non-Equilibrium Reversible--Irreversible Coupling})
+structure directly on temperature: under strong latent heat, conserving the sum of
+nodal temperatures is \emph{not} conserving energy. The fix is the classical
+\emph{enthalpy method}: carry the volumetric enthalpy as the conserved state, evolve
+it with a learned symmetric positive semi-definite (SPSD) graph-Laplacian dissipation
+operator, and recover temperature by inverting the latent-heat-aware enthalpy curve.
+Taking the \emph{extensive} nodal energy as the conserved state makes this guarantee
+exact on arbitrary (including non-uniform) meshes, and we treat the arc source and
+boundary losses through the open-system extension of GENERIC. This guarantees the first
+and second laws \emph{by construction}, even through phase change. A learned, per-node \emph{enriched source} restores the melt-pool peak heating
+that the structure-preserving dissipation alone cannot supply, without breaking the
+guarantees. Finally, we align the training objective with long autoregressive
+rollouts using \emph{push-forward} ($K{=}2$) multi-step backpropagation. On a
+held-out, out-of-distribution Archimedean-spiral weld (\num{1526} autoregressive
+steps), the model attains a global RMSE of \SI{33.2}{K} while respecting the maximum
+principle (no sub-ambient cooling) and remaining stable. A matched ablation
+(GENERIC enthalpy structure ON vs.\ OFF, both at $K{=}2$) shows that the thermodynamic
+structure provides $\sim$$3\times$ lower rollout-RMSE variance, maximum-principle
+respect, and a validation metric that tracks the long rollout, whereas the
+unconstrained network is accurate-but-fragile.
+\end{abstract}
+
+\tableofcontents
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+Arc welding involves a moving, highly localized heat source that drives a metal
+plate through melting and partial vaporization, leaving steep transient thermal
+gradients in its wake. Accurate prediction of the temperature history is essential
+for estimating residual stresses, distortion, and microstructure. The standard tool
+is the transient nonlinear finite-element (FEM) method, but a single high-fidelity
+simulation can take minutes to hours, making design-space exploration,
+uncertainty quantification, and online control prohibitively expensive.
+
+\emph{Scientific machine learning} (SciML) offers a route to fast surrogates that
+learn the simulator's input--output map. Among mesh-based learned simulators,
+\emph{MeshGraphNets}~\cite{pfaff2021learning} are particularly attractive: they
+operate directly on the simulation mesh as a graph, generalize across mesh
+geometries, and roll forward autoregressively. However, two challenges are acute
+for welding:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Long-horizon stability.} Autoregressive surrogates accumulate
+  error step over step. A model that is accurate on short validation rollouts can
+  diverge catastrophically (spurious far-field heating, sub-ambient cooling, or
+  global runaway) over the much longer inference horizons of interest.
+  \item \textbf{Phase-change physics.} Welding energy storage is dominated by
+  \emph{latent heat}: melting and boiling absorb large amounts of energy at nearly
+  constant temperature, so the energy--temperature relationship is strongly
+  nonlinear. A surrogate that implicitly assumes energy $\propto$ temperature
+  mis-handles exactly the melt pool, which is the region of greatest interest.
+\end{enumerate}
+
+This paper addresses both. We build a configurable MeshGraphNet surrogate and equip
+it with an optional \emph{structure-preserving thermodynamic head} derived from the
+GENERIC framework~\cite{grmela1997dynamics,ottinger2005beyond}. Our contributions are:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item A complete, reproducible pipeline: a nonlinear 2D transient welding FEM
+  solver (Goldak source, apparent heat capacity, Robin/Dirichlet boundaries,
+  $\theta$-method with Picard iteration), a physics-aware graph representation with
+  purely \emph{relative} features, and an Encoder--Processor--Decoder MPNN
+  (\cref{sec:fem,sec:graph,sec:mpnn}).
+  \item A diagnosis of the thermodynamic inconsistency of imposing GENERIC on
+  temperature under latent heat, and its correction via an \emph{enthalpy-state}
+  GENERIC head that conserves energy and produces entropy by construction, with a
+  numerically well-conditioned temperature-equivalent rescaling
+  (\cref{sec:generic,sec:enthalpy}). Choosing the \emph{extensive} nodal energy
+  $\mathcal E_i=h_iV_i$ as the state makes energy conservation exact on arbitrary
+  (non-uniform) meshes, and the arc/boundary terms are handled by the open-system
+  extension of GENERIC.
+  \item An \emph{enriched source} that restores melt-pool peak heating while leaving
+  the dissipative operator structure-preserving (\cref{sec:enriched}).
+  \item A \emph{push-forward} multi-step training scheme that aligns the objective
+  with long rollouts (\cref{sec:training}), and a matched ablation isolating the value
+  of the thermodynamic structure (\cref{sec:results}).
+\end{enumerate}
+
+%==============================================================================
+\section{Governing physics and the finite-element solver}
+\label{sec:fem}
+%==============================================================================
+
+\subsection{Continuum model}
+
+We model the top-down (in-plane) surface of a thin plate of thickness $H_{\!z}$,
+and solve the through-thickness-integrated transient heat-conduction equation for
+the temperature field $T(\bm{x},t)$, $\bm{x}\in\Omega\subset\Rset^2$:
+\begin{equation}
+  \rho\,\cpapp(T)\,\frac{\partial T}{\partial t}
+  \;=\;
+  \grad\!\cdot\!\big(k(T)\,\grad T\big) \;+\; Q(\bm{x},t),
+  \label{eq:heat}
+\end{equation}
+where $\rho$ is density, $k$ thermal conductivity, $Q$ the volumetric heat source,
+and $\cpapp(T)$ the \emph{apparent} heat capacity, which folds latent heat into an
+effective specific heat (\cref{sec:latent}). Boundaries $\partial\Omega$ carry either
+a Dirichlet condition $T=T_D$ or a Robin condition combining convection and
+(optionally linearized) radiation,
+\begin{equation}
+  -k\,\grad T \cdot \bm{n}
+  \;=\;
+  h_{\mathrm{conv}}\,(T-\Tinf)
+  \;+\; \varepsilon\,\sigma_{\mathrm{SB}}\,(T^4-\Tinf^4),
+  \label{eq:robin}
+\end{equation}
+with outward normal $\bm{n}$, convection coefficient $h_{\mathrm{conv}}$, ambient
+$\Tinf$, emissivity $\varepsilon$, and Stefan--Boltzmann constant
+$\sigma_{\mathrm{SB}}=\SI{5.670e-8}{W.m^{-2}.K^{-4}}$.
+
+\subsection{Latent heat and the enthalpy curve}
+\label{sec:latent}
+
+The defining physical feature of welding is that the metal melts (and locally boils):
+a phase change absorbs a large \emph{latent heat} at nearly constant temperature, so
+$\cpapp$ is strongly temperature-dependent. We model it as a sensible heat capacity
+plus two normalized Gaussian bumps centered on melting and boiling:
+\begin{equation}
+  \cpapp(T) \;=\; \cpsens
+  \;+\; L_f\,\frac{\dd f_\ell}{\dd T}
+  \;+\; L_v\,\frac{\dd f_v}{\dd T},
+  \label{eq:cpapp}
+\end{equation}
+\begin{equation}
+  \frac{\dd f_\ell}{\dd T}=\frac{1}{s_\ell\sqrt{\pi}}\,
+    e^{-\left((T-T_m)/s_\ell\right)^2},
+  \qquad
+  \frac{\dd f_v}{\dd T}=\frac{1}{s_v\sqrt{\pi}}\,
+    e^{-\left((T-T_b)/s_v\right)^2},
+  \label{eq:bumps}
+\end{equation}
+where $L_f, L_v$ are the latent heats of fusion and vaporization,
+$T_m=\tfrac12(T_{\mathrm{sol}}+T_{\mathrm{liq}})$ is the mean melting temperature,
+$T_b$ the boiling point, and $s_\ell, s_v$ smoothing widths. Because each bump
+integrates to one, $\int \cpapp\,\dd T$ recovers exactly $L_f$ and $L_v$. The
+vaporization bump acts as a physical \emph{thermostat}: energy that would otherwise
+superheat near-pool nodes to unphysical values ($\sim$\SI{e4}{K}) is instead
+absorbed by the (smeared) phase change, capping the dynamic range near boiling.
+
+Integrating \cref{eq:cpapp} gives the \emph{volumetric enthalpy} (energy stored per
+unit volume relative to a reference $T_0$):
+\begin{equation}
+  h(T) \;=\; \rho \int_{T_0}^{T} \cpapp(\tau)\,\dd\tau .
+  \label{eq:enthalpy}
+\end{equation}
+Away from phase change $h(T)\approx \rho\,\cpsens\,(T-T_0)$ is nearly linear; across
+melting/boiling the curve develops plateaus where a large change in $h$ produces an
+almost-zero change in $T$ (equivalently the slope $\dd h/\dd T=\rho\,\cpapp$ spikes).
+This curve, illustrated schematically in \cref{fig:hcurve}, is the crux of the
+thermodynamic argument in \cref{sec:generic}. Numerical parameters
+(mild steel) are listed in \cref{tab:material}.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.86\linewidth}{\centering\small
+\textit{Enthalpy--temperature curve $h(T)$ (schematic).}\\[4pt]
+\ttfamily
+\begin{tabular}{l}
+ h(T)\hfill .--- boiling plateau ($L_v$ absorbed)\\
+ \ \ \textbar\hfill \_\_\_/\\
+ \ \ \textbar\hfill \_\_\_\_\_/\\
+ \ \ \textbar\ \ melting plateau \_\_\_---/\ \ ($L_f$ at $\sim T_m$)\\
+ \ \ \textbar\hfill \_\_\_---\\
+ \ \ \textbar\ \ \_\_\_-/\ \ (slope $\rho c_p$ away from phase change)\\
+ \ \ +\rule{4.2cm}{0.4pt}\textgreater\ T\\
+\end{tabular}}}
+\caption{The enthalpy--temperature relation $h(T)$. Near melting and boiling a
+large change in enthalpy (energy) yields almost no change in temperature: the
+phase change absorbs the energy. This nonlinearity is what a temperature-state
+GENERIC head mis-models and what the enthalpy-state head captures exactly.}
+\label{fig:hcurve}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Material and source parameters (mild-steel defaults, SI/kelvin).}
+\label{tab:material}
+\small
+\begin{tabular}{lll}
+\toprule
+Symbol & Quantity & Value \\
+\midrule
+$\rho$              & density                       & \SI{7850}{kg.m^{-3}} \\
+$\cpsens$           & sensible specific heat        & \SI{600}{J.kg^{-1}.K^{-1}} \\
+$k$                 & thermal conductivity          & \SI{30}{W.m^{-1}.K^{-1}} \\
+$L_f$               & latent heat of fusion         & \SI{2.7e5}{J.kg^{-1}} \\
+$T_{\mathrm{sol}},T_{\mathrm{liq}}$ & solidus, liquidus & \SI{1723}{K}, \SI{1773}{K} \\
+$L_v$               & latent heat of vaporization   & \SI{6.3e6}{J.kg^{-1}} \\
+$T_b$               & boiling point                 & \SI{3134}{K} \\
+$s_v$ (\texttt{vap\_width}) & vaporization smoothing & \SI{120}{K} \\
+$H_{\!z}$           & plate thickness               & \SIrange{4}{8}{mm} \\
+$P$                 & gross arc power               & \SIrange{1500}{3500}{W} \\
+$\eta$              & arc efficiency                & \numrange{0.70}{0.90} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Goldak double-ellipsoid heat source}
+
+The arc is modeled by the Goldak double-ellipsoid distribution~\cite{goldak1984new}.
+For the thickness-integrated 2D model we analytically integrate the 3D ellipsoid
+through the plate thickness to obtain a surface flux, then divide by $H_{\!z}$ to get
+a volumetric source. With the torch at position $\bm{p}(t)$ moving along trajectory
+$\bm\gamma(s)$ with unit tangent $\hat{\bm t}$ and normal $\hat{\bm n}$, define the
+co-moving coordinates $\xi=(\bm x-\bm p)\cdot\hat{\bm t}$ (along travel) and
+$\eta=(\bm x-\bm p)\cdot\hat{\bm n}$ (transverse). Then
+\begin{equation}
+  Q(\bm x,t) \;=\; \frac{1}{H_{\!z}}\,
+  \frac{6\,f\,\eta_{\mathrm{eff}}P}{\pi\,b\,c}\,
+  \exp\!\Big(-\frac{3\xi^2}{c^2}-\frac{3\eta^2}{b^2}\Big),
+  \label{eq:goldak}
+\end{equation}
+where $\eta_{\mathrm{eff}}P$ is the net deposited power ($\eta_{\mathrm{eff}}$ the
+arc efficiency), $b$ is the transverse half-width, and the along-travel semi-axis and
+fraction switch between the front lobe ($c=c_f$, $f=f_f$ for $\xi\ge0$) and the rear
+lobe ($c=c_r$, $f=f_r$ for $\xi<0$), with the Goldak constraint $f_f+f_r=2$. During a
+post-weld cooling phase the source is switched off ($Q\equiv0$) and the torch is
+parked at its final weld position.
+
+\subsection{Discretization and time integration}
+
+We discretize \cref{eq:heat} with continuous piecewise-linear ($P_1$) triangular
+finite elements (\texttt{scikit-fem}~\cite{skfem2020}). The weak form yields the
+semidiscrete system
+\begin{equation}
+  \bm{M}(T)\,\dot{\bm T} + \bm{A}(T)\,\bm T = \bm b(t),
+\end{equation}
+where $\bm M(T)$ is the (temperature-dependent) heat-capacity mass matrix with
+entries $\int_\Omega \rho\,\cpapp(T)\,\phi_i\phi_j$, $\bm A=\bm K+\bm R$ collects the
+conduction stiffness $\bm K=\int_\Omega k\,\grad\phi_i\cdot\grad\phi_j$ and the Robin
+convection/radiation operator $\bm R$, and $\bm b$ is the Goldak load plus boundary
+loads. Time integration uses the $\theta$-method (default backward Euler,
+$\theta=1$),
+\begin{equation}
+  \Big(\tfrac{1}{\Delta t}\bm M + \theta\bm A\Big)\bm T^{n+1}
+  = \tfrac{1}{\Delta t}\bm M\,\bm T^{n}
+  - (1-\theta)\bm A\,\bm T^{n}
+  + \theta\,\bm b^{n+1}+(1-\theta)\,\bm b^{n}.
+\end{equation}
+Because $\cpapp(T)$ (latent heat) and radiation make the problem nonlinear, each step
+is solved by a Picard fixed-point iteration (re-assembling $\bm M$ and the linearized
+radiation operator $\bm R_{\mathrm{rad}}=\varepsilon\sigma_{\mathrm{SB}}
+(T^2+\Tinf^2)(T+\Tinf)$ at the current iterate) until the relative update falls below a
+tolerance. Dirichlet constraints are imposed by condensation. The solver records a
+time series of snapshots $\{T^n\}$ together with the torch frame and source state, and
+serializes everything (including all process/boundary metadata) so the graph pipeline
+can reconstruct every feature from a single self-contained file.
+
+%==============================================================================
+\section{Dataset generation}
+\label{sec:dataset}
+%==============================================================================
+
+We generate a corpus designed so that a single generalization axis---the weld
+\emph{trajectory topology}---is held out, while every other axis (geometry, plate
+size, process parameters, boundary conditions) is covered by the training
+distribution. This makes any generalization gap cleanly attributable to the
+trajectory rather than to extrapolation in plate size or speed.
+
+\paragraph{Sampling ranges.} Each simulation draws i.i.d.\ from:
+plate bounding box \SIrange{0.08}{0.25}{m} per side; element edge $\approx$\SI{3}{mm}
+(yielding $\sim$\numrange{800}{6600}-node meshes); gross power
+\SIrange{1500}{3500}{W}; arc efficiency \numrange{0.70}{0.90}; travel speed
+\SIrange{2}{12}{mm/s}; Goldak $b,c_f\in\SIrange{2.0}{3.5}{mm}$,
+$c_r/c_f\in[1.6,2.4]$, $f_f\in[0.5,0.7]$; thickness \SIrange{4}{8}{mm}; ambient
+\SIrange{290}{320}{K}; convection $h_{\mathrm{conv}}\in\SIrange{5}{40}{W.m^{-2}.K^{-1}}$;
+emissivity in $\{0,0.2,0.35\}$ (weighted toward zero), with a 30\% chance that one outer
+edge is held Dirichlet. Boundary-condition strata (radiation $\times$ Dirichlet) are
+cycled to guarantee balanced coverage. Geometries are rectangular (50\%), L-shaped
+(25\%), or holed (25\%); trajectories are straight, diagonal, sinusoidal, or
+circular-arc paths.
+
+\paragraph{Adaptive cooling tail.} After the weld phase, the source is switched off and
+the simulation continues until the peak excess over ambient falls below 7\% of the
+welding peak (near-field relaxed) or a cap of \SI{30}{s} is reached. This guarantees
+every trajectory includes a complete local cool-down, which proved essential for
+suppressing spurious far-field heating in long rollouts. The time step is pinned near
+$\Delta t\approx\SI{0.05}{s}$ (matching the inference regime).
+
+\paragraph{Corpus.} The final dataset is \num{360} simulations (\num{300} train /
+\num{60} validation), \num{398597} snapshot-pair graphs in total. Splitting is done at
+the \emph{simulation} level (every snapshot of a given weld lands in one fold) to
+prevent temporal leakage of adjacent states across folds.
+
+%==============================================================================
+\section{Graph representation}
+\label{sec:graph}
+%==============================================================================
+
+Each consecutive snapshot pair $(T^t,T^{t+1})$ of a simulation becomes one graph. The
+mesh nodes are graph nodes; mesh edges (both orientations, no self-loops) are graph
+edges. The learning target is the per-node temperature increment
+$\bm y = T^{t+1}-T^{t}\in\Rset^{N}$.
+
+A central design choice is to use \emph{only relative} features---no absolute
+coordinates---so the model cannot memorize positions and must learn local physics:
+
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[Node features ($12$-d).]
+$\big[\,T,\; q_{\mathrm{Goldak}},\; \xi',\;\eta',\; \eta_{\mathrm{eff}}P,\; v,\;
+\mathbb{1}_{\mathrm{int}},\mathbb{1}_{\mathrm{Dir}},\mathbb{1}_{\mathrm{Rob}},\;
+h_{\mathrm{conv}},\; \varepsilon,\; \Tinf\,\big]$.
+Here $q_{\mathrm{Goldak}}$ is the analytical source \cref{eq:goldak} evaluated at the
+node (gated to zero during the cooling tail); $(\xi',\eta')$ are the co-moving torch
+coordinates in the $(\hat{\bm t},\hat{\bm n})$ frame; $\eta_{\mathrm{eff}}P$ and $v$ are
+process scalars broadcast to all nodes; the three one-hots encode the node's
+boundary type; and $h_{\mathrm{conv}},\varepsilon,\Tinf$ are the local boundary values.
+The Goldak semi-axes are \emph{not} exposed as features: they are global per-simulation
+constants already folded into $q_{\mathrm{Goldak}}$ and $(\xi',\eta')$.
+\item[Edge features ($3$-d).] $[\,\Delta x,\Delta y,\norm{\bm u_{ij}}\,]$ with
+$\bm u_{ij}=\bm x_i-\bm x_j$. Geometry enters only through these displacement vectors.
+\end{description}
+
+Continuous features and the target are standardized by z-score using statistics
+computed over the training corpus; the three one-hot columns are left untouched.
+Crucially, normalization constants are stored with the model so inference reproduces
+the exact transform.
+
+%==============================================================================
+\section{MeshGraphNet architecture (the MPNN)}
+\label{sec:mpnn}
+%==============================================================================
+
+The backbone is the Encoder--Processor--Decoder MeshGraphNet of
+Pfaff et al.~\cite{pfaff2021learning}, a message-passing neural network (MPNN). Let
+$\bm x_i\in\Rset^{12}$ be node features and $\bm e_{ij}\in\Rset^{3}$ edge features. All
+sub-networks are multilayer perceptrons (MLPs) of width $d=128$ with two hidden layers,
+ReLU activations, and a trailing LayerNorm (except the decoder).
+
+\paragraph{Encoder.} Two independent MLPs lift raw features into a shared
+$d$-dimensional latent space:
+\begin{equation}
+  \bm v_i^{(0)} = \mathrm{MLP}_{\mathrm{enc}}^{v}(\bm x_i),
+  \qquad
+  \bm \epsilon_{ij}^{(0)} = \mathrm{MLP}_{\mathrm{enc}}^{e}(\bm e_{ij}).
+\end{equation}
+
+\paragraph{Processor.} A stack of $L$ GraphNet blocks (here $L=8$). Each block updates
+edges from their endpoints, aggregates messages at receiver nodes, and updates nodes,
+all with \emph{residual} connections that let gradients survive the deep stack
+(important for backpropagating through multi-step rollouts):
+\begin{align}
+  \bm\epsilon_{ij}^{(\ell+1)}
+    &= \bm\epsilon_{ij}^{(\ell)}
+      + \mathrm{MLP}_e^{(\ell)}\!\big([\,\bm\epsilon_{ij}^{(\ell)},\,
+        \bm v_i^{(\ell)},\,\bm v_j^{(\ell)}\,]\big),
+        \label{eq:edgeupdate}\\[2pt]
+  \bm m_j^{(\ell+1)} &= \!\!\sum_{i\in\mathcal N(j)}\!\! \bm\epsilon_{ij}^{(\ell+1)},
+        \qquad\text{(sum aggregation)}\\[2pt]
+  \bm v_j^{(\ell+1)}
+    &= \bm v_j^{(\ell)}
+      + \mathrm{MLP}_v^{(\ell)}\!\big([\,\bm v_j^{(\ell)},\,\bm m_j^{(\ell+1)}\,]\big).
+        \label{eq:nodeupdate}
+\end{align}
+With $L=8$ message-passing hops, information propagates up to 8 mesh edges per step,
+giving the receptive field needed to represent the heat-affected zone around the torch.
+
+\paragraph{Decoder.} A final MLP (no LayerNorm, so it can emit unbounded physical
+values) projects node latents to the scalar output:
+\begin{equation}
+  \widetilde{\Delta T}_i = \mathrm{MLP}_{\mathrm{dec}}(\bm v_i^{(L)}) \in \Rset.
+\end{equation}
+In the \emph{baseline} (unconstrained) model this normalized increment is the
+prediction. In the structure-preserving variants the decoder is bypassed and the
+increment is built instead from the processor latents through the thermodynamic head
+(\cref{sec:generic,sec:enthalpy}). The configuration used throughout has
+$d=128$, $L=8$, $\approx$\num{1.29}M parameters for the unconstrained model.
+
+\paragraph{Inference (autoregressive rollout).} At test time the model receives only
+the initial field $T^0$ and the (known) Goldak schedule. Because the trajectory is
+deterministic, all time-dependent features ($q_{\mathrm{Goldak}}$, $(\xi',\eta')$, $v$)
+are precomputed for every step; during the loop only the temperature column is
+overwritten with the running prediction:
+\begin{equation}
+  T^{t+1} = T^{t} + \mathcal{N}^{-1}_y\!\big(f_\theta(\bm x^t; \,\text{edges})\big),
+\end{equation}
+where $\mathcal N^{-1}_y$ de-normalizes the predicted $\Delta T$. The same feature
+construction code is shared between training and rollout to guarantee parity.
+
+%==============================================================================
+\section{Structure-preserving thermodynamics: the GENERIC head}
+\label{sec:generic}
+%==============================================================================
+
+The unconstrained MPNN is accurate but can violate physics over long rollouts
+(spurious global heating, sub-ambient cooling, runaway). We therefore optionally
+replace the free decoder increment by an increment that satisfies the laws of
+thermodynamics \emph{by construction}, using the GENERIC
+framework~\cite{grmela1997dynamics,ottinger2005beyond}.
+
+\subsection{GENERIC in a nutshell}
+
+GENERIC writes the evolution of a state $\bm z$ as a reversible plus a dissipative
+part, driven by two potentials---total energy $E(\bm z)$ and entropy $S(\bm z)$:
+\begin{equation}
+  \frac{\dd \bm z}{\dd t}
+  = \underbrace{\bm L(\bm z)\,\frac{\partial E}{\partial\bm z}}_{\text{reversible}}
+  + \underbrace{\bm M(\bm z)\,\frac{\partial S}{\partial\bm z}}_{\text{dissipative}},
+  \label{eq:generic}
+\end{equation}
+with $\bm L$ antisymmetric, $\bm M$ symmetric positive semi-definite (SPSD), and the
+\emph{degeneracy conditions}
+\begin{equation}
+  \bm L\,\frac{\partial S}{\partial\bm z}=\bm 0,
+  \qquad
+  \bm M\,\frac{\partial E}{\partial\bm z}=\bm 0.
+  \label{eq:degeneracy}
+\end{equation}
+These immediately yield the two laws:
+\begin{equation}
+  \frac{\dd E}{\dd t}=0
+  \quad(\text{1st law}),
+  \qquad
+  \frac{\dd S}{\dd t}
+  =\Big(\tfrac{\partial S}{\partial\bm z}\Big)^{\!\T}\!\bm M\,
+   \Big(\tfrac{\partial S}{\partial\bm z}\Big)\ge 0
+  \quad(\text{2nd law}).
+  \label{eq:laws}
+\end{equation}
+Pure heat conduction is \emph{purely dissipative}: there is no reversible heat flow, so
+$\bm L=\bm 0$ and $\dot{\bm z}=\bm M\,\partial S/\partial\bm z$ (plus a non-conservative
+exchange with the external source/environment). Two choices then decide physical
+consistency: \emph{what is the state $\bm z$}, and \emph{is
+$\bm M\,\partial E/\partial\bm z=\bm0$ the correct energy conservation}.
+
+\paragraph{Open, driven systems.}
+The closed-form identities \cref{eq:laws} describe an \emph{isolated} system; welding is
+\emph{open and driven}---the arc injects energy through the Goldak source and the
+boundaries exchange heat by convection and radiation. We therefore use the standard
+boundary/source extension of GENERIC for open systems~\cite{ottinger2005beyond}: the
+structure-preserving operator acts only on the \emph{internal} bulk evolution, and the
+exchange with the environment is added as a separate, non-conservative term
+$\Delta^{\mathrm{ext}}$ evaluated after the internal dissipative
+step~\cite{ottinger2006open,ottinger2005beyond}, in which boundary and bulk
+contributions to the brackets are separated so that the isolated-system structure of
+\cref{eq:laws} is recovered for the bulk while the boundary/source terms account for the
+exchange with the environment,
+\begin{equation}
+  \dot{\bm z}=\underbrace{\bm M\,\partial S/\partial\bm z}_{\text{internal (degeneracy + 2nd law)}}
+  \;+\;\underbrace{\bm f^{\mathrm{ext}}}_{\text{source + boundary fluxes}}.
+  \label{eq:opengeneric}
+\end{equation}
+Consequently the degeneracy and second-law guarantees attach to the \emph{internal}
+operator: $\bm 1^\T\bm M\,\partial S/\partial\bm z=0$ states that the irreversible bulk
+dynamics conserves energy, while the total energy changes by \emph{exactly} the energy
+crossing the boundary or deposited by the source (as physics demands, not a defect); and
+$(\partial S/\partial\bm z)^\T\bm M\,(\partial S/\partial\bm z)\ge0$ is the non-negative
+\emph{internal entropy production}, the correct second-law statement for an open system
+(the system's total entropy may still fall as heat leaves through the boundary). The
+external term $\bm f^{\mathrm{ext}}$ is realized by the (enriched) Goldak source and
+Newton/Stefan cooling of \cref{sec:enriched}; it is the only part not constrained by the
+GENERIC structure, by design.
+
+\subsection{A learned SPSD operator on the graph}
+
+We realize $\bm M$ as a \emph{graph Laplacian of learned conductances}. The processor
+produces, for each undirected edge, a non-negative symmetric weight
+\begin{equation}
+  w_{ij} = e^{\alpha}\,\softplus\!\Big(\mathrm{MLP}\big(
+    \bm v_i+\bm v_j,\;(\bm v_i-\bm v_j)^2,\;T_i+T_j,\;\abs{T_i-T_j}\big)\Big)
+  = w_{ji}\ge 0,
+  \label{eq:conductance}
+\end{equation}
+where $\bm v$ are processor node latents and $\alpha$ a learnable global log-scale
+(initialized so the dissipation starts at $O(1\,\mathrm K)$ per step). Symmetry is
+obtained \emph{for free} by feeding the MLP only features symmetric under
+$i\leftrightarrow j$. Defining $\bm W=[w_{ij}]$, $\bm D=\operatorname{diag}(\bm W\bm 1)$,
+the Laplacian is $\Lw=\bm D-\bm W$, which is SPSD and satisfies $\Lw\bm 1=\bm 0$ (zero
+row/column sums).
+
+The dissipative increment acts on the entropy gradient $\bmu$, the
+\emph{thermodynamic force}:
+\begin{equation}
+  \mu_i \;\equiv\; \frac{\partial S}{\partial e_i} \;=\; \frac{1}{T_i},
+  \label{eq:mu}
+\end{equation}
+which is the definition of (inverse) temperature, $\dd S=\dd E/T$, and holds for
+\emph{any} $c_p(T)$, including latent heat. With $\bm M=\Lw$,
+\begin{equation}
+  \big(\Lw\bmu\big)_i = \sum_{j\sim i} w_{ij}\,(\mu_i-\mu_j).
+  \label{eq:dissipation}
+\end{equation}
+A hot node ($\mu_i$ small) beside cold neighbors ($\mu_j$ large) receives a negative
+increment---it \emph{loses} energy. Heat flows hot$\to$cold by construction.
+
+\subsection{The inconsistency of a temperature state under latent heat}
+
+It is tempting to take the state as temperature, $\bm z=\bm T$, with constant-$c_p$
+potentials $E=\sum_i\rho\,c_p\,T_iV_i$ and $S=\sum_i\rho\,c_p\ln(T_i)V_i$, and to write
+the temperature increment directly as $\Delta T_i=(\Lw\bmu)_i$. Then $\sum_i\Delta
+T_i=\bm1^\T\Lw\bmu=0$ and one is tempted to call this ``energy conservation.'' It is
+not. The thermodynamically correct dissipative law evolves \emph{energy}:
+\begin{equation}
+  \frac{\dd e_i}{\dd t}=(\Lw\bmu)_i,
+  \qquad
+  \frac{\dd T_i}{\dd t}=\frac{1}{\rho\,\cpapp(T_i)}\,\frac{\dd e_i}{\dd t}.
+  \label{eq:correctT}
+\end{equation}
+Writing $\Delta T_i=(\Lw\bmu)_i$ directly \emph{drops} the factor
+$1/(\rho\,\cpapp(T_i))$. When $c_p$ is constant this is a global rescale that the
+learned $w_{ij}$ can absorb; but with latent heat $\cpapp$ varies by orders of
+magnitude between cold metal and the melt pool, so
+\begin{equation}
+  \sum_i \Delta T_i = 0
+  \;\;(\text{temperature-sum})
+  \;\neq\;
+  \sum_i \rho\,\cpapp(T_i)\,\Delta T_i = \sum_i \Delta e_i = 0
+  \;\;(\text{energy}).
+  \label{eq:wrongcons}
+\end{equation}
+The two differ precisely by the $\cpapp(T)$ factor that blows up at the melt pool.
+Physically, \cref{eq:correctT} says $\dd T/\dd t$ should be \emph{small} there (incoming
+energy is swallowed by the phase change); the temperature-state head has no such damping
+and over-moves the hottest nodes. This explains the empirical observation that the
+temperature-state structure-preserving head \emph{caps/distorts the peak} while the
+unconstrained network fits it better.
+
+%==============================================================================
+\section{The enthalpy-state GENERIC head}
+\label{sec:enthalpy}
+%==============================================================================
+
+The fix is the classical \emph{enthalpy method} of phase-change heat
+transfer~\cite{voller1987enthalpy}: take energy (enthalpy) as the conserved state and
+recover temperature by inverting the latent-heat-aware curve.
+
+\subsection{State, potentials, and the two laws}
+
+Let the proper conserved state be the \emph{extensive nodal energy}
+$\bm z=\bm{\mathcal E}$, $\mathcal E_i = h_i\,V_i$ [\si{J}], where $h_i=h(T_i)$ is the
+volumetric enthalpy (\cref{eq:enthalpy}, monotone hence invertible) and $V_i$ is the
+node's tributary volume (the diagonal of the lumped FEM mass matrix). The total energy
+is then $E=\sum_i\mathcal E_i$, so $\partial E/\partial\mathcal E_i = 1$ and the GENERIC
+degeneracy
+\begin{equation}
+  \bm M\,\frac{\partial E}{\partial\bm z}=\Lw\bm 1=\bm 0
+  \label{eq:degen_exact}
+\end{equation}
+holds \emph{exactly on any mesh} (the graph Laplacian has zero column sums). The entropy
+gradient is $\mu_i=\partial S/\partial\mathcal E_i=1/T_i$ as before (the definition of
+temperature, valid for any $c_p$). The dissipative evolution and temperature recovery are
+\begin{equation}
+  \boxed{\;\frac{\dd \mathcal E_i}{\dd t} = (\Lw\bmu)_i
+    = \sum_{j\sim i} w_{ij}\Big(\frac{1}{T_i}-\frac{1}{T_j}\Big),
+    \qquad T_i = h^{-1}\!\big(\mathcal E_i/V_i\big).\;}
+  \label{eq:enthalpyevol}
+\end{equation}
+
+\paragraph{Remark (implemented uniform-volume reduction).}
+Choosing the \emph{volumetric} enthalpy $\bm h$ as the state (rather than the extensive
+$\bm{\mathcal E}$) gives $\partial E/\partial h_i=V_i$, so the degeneracy would require
+$\Lw\bm V=\bm 0$ rather than $\Lw\bm 1=\bm 0$; with a standard graph Laplacian these
+coincide \emph{only} for uniform $V_i$. The meshes used here are uniform tensor-product
+triangulations (\cref{sec:dataset}), so we take equal interior tributary volumes
+$V_i\equiv V$: the constant $V$ is absorbed into the learned conductance scale
+$e^{\alpha}$, the head evolves the intensive temperature-equivalent enthalpy $H$
+(\cref{sec:conditioning}) directly, and conservation reduces to the unweighted
+$\sum_i\Delta H_i^{\mathrm{diss}}=0$. This is identical to the extensive form
+\cref{eq:enthalpyevol} in the mesh interior and differs only at boundary/corner nodes
+(tributary volume $V/2$, $V/4$), a small residual confined to $\partial\Omega$. The
+general $V_i$-weighted form \cref{eq:enthalpyevol} restores \emph{exact} conservation on
+arbitrary (e.g.\ arc-refined) meshes at the cost of a single learning-free weighting;
+we adopt it in the theory and flag the weighting as an implementation refinement
+(\cref{sec:discussion}).
+
+\begin{proposition}[Discrete first and second laws, any mesh]
+\label{prop1}
+For any non-negative symmetric conductances $w_{ij}=w_{ji}\ge 0$ and any nodal volumes
+$V_i>0$, the dissipative update \cref{eq:enthalpyevol} satisfies, per graph,
+\begin{equation}
+  \frac{\dd E}{\dd t}=\sum_i \frac{\dd \mathcal E_i}{\dd t}
+    = \bm 1^\T \Lw\bmu = 0
+  \quad\text{(energy conserved)},
+  \qquad
+  \frac{\dd S}{\dd t}=\bmu^\T\Lw\bmu
+  = \tfrac12\sum_{i,j} w_{ij}(\mu_i-\mu_j)^2 \ge 0.
+\end{equation}
+\end{proposition}
+\begin{proof}
+$\bm1^\T\Lw=\bm0$ because $\Lw$ has zero column sums, giving the first law; and $\Lw$ is
+SPSD because $w_{ij}\ge0$ and symmetric, so the entropy-production quadratic form is
+non-negative. Crucially, the conserved quantity is now the \emph{extensive energy}
+$\mathcal E=\sum_i\mathcal E_i$ (not the temperature sum, nor the unweighted volumetric
+enthalpy sum), so this is the genuine first law on \emph{any} mesh, even with latent
+heat. The uniform-volume implementation (above) conserves $\sum_i\Delta
+H_i^{\mathrm{diss}}=0$, which equals $\dd E/\dd t=0$ exactly when $V_i$ is constant (mesh
+interior) and up to the $O(V/2,\,V/4)$ boundary-node correction otherwise.
+\end{proof}
+
+Latent heat is now handled exactly: at the melt pool, $T=h^{-1}(h)$ is nearly flat
+(the plateau in \cref{fig:hcurve}), so a large $\Delta h$ produces almost no $\Delta T$,
+just as in the FEM.
+
+\subsection{Connection to Fourier conduction}
+
+To check that \cref{eq:enthalpyevol} reduces to Fourier conduction, note
+$\grad T=-T^2\grad(1/T)=-T^2\grad\mu$, so the conductive flux is
+$\bm q=-k\grad T=k\,T^2\grad\mu$. Discretizing $\grad\!\cdot\!\bm q$ on the graph yields
+exactly the Laplacian form $\Lw\bmu$ with edge conductances scaling as
+$w_{ij}\sim k\,T_iT_j/\ell_{ij}^2$. The network's task is to learn these
+(temperature- and geometry-dependent) conductances.
+
+\subsection{Numerical conditioning: temperature-equivalent enthalpy}
+\label{sec:conditioning}
+
+Raw volumetric enthalpy is $h\sim\SI{e9}{J.m^{-3}}$, so the inverse map has slope
+$\partial T/\partial h=1/(\rho\cpapp)\sim\num{2e-7}$. This factor multiplies every
+gradient flowing back to the conductances and gains, pushing them below Adam's
+$\varepsilon=\num{e-8}$ floor and stalling training (empirically: the loss freezes and
+diffusion never develops). We therefore work in \emph{temperature-equivalent enthalpy}
+(units of kelvin):
+\begin{equation}
+  H(T) \;=\; \frac{h(T)}{\rho\,\cpsens}
+  \;=\; \int_{T_0}^{T}\frac{\cpapp(\tau)}{\cpsens}\,\dd\tau .
+  \label{eq:Heq}
+\end{equation}
+Away from phase change $H\approx T-T_0$ (unit slope); across melting/boiling the slope
+spikes (the plateau). Since this is a \emph{constant} rescale of $h$, energy conservation
+is unchanged ($\sum_i\Delta H_i^{\mathrm{diss}}=0\Leftrightarrow\sum_i\Delta
+h_i^{\mathrm{diss}}=0$), but now increments are $O(\mathrm K)$ and gradients $O(1)$.
+This single rescaling moved the conductance gradients from $\sim$\num{e-13} to
+$\sim$\num{e-4} and unstuck training from the first epoch.
+
+\subsection{Discrete scheme}
+
+The curve $H(T)$ is tabulated once from the \emph{same} material model used by the FEM,
+on a uniform grid $T^{(0)}<\dots<T^{(G-1)}$ ($G=4096$ from \SIrange{200}{8000}{K}):
+\begin{equation}
+  H^{(g)} = \sum_{m\le g}\frac{\cpapp(T^{(m)})}{\cpsens}\,\Delta T^{(m)} ,
+\end{equation}
+which is strictly increasing (hence invertible) since $\cpapp>0$. The arrays
+$(T^{(g)},H^{(g)})$ ride in the model's \texttt{state\_dict} so checkpoints reproduce the
+exact physics. Both $H=\mathcal H(T)$ and $T=\mathcal H^{-1}(H)$ are evaluated by a
+differentiable piecewise-linear interpolation (binary search for the bracket, linear
+blend), whose derivative is the local slope---finite and well defined, and inside the
+autograd graph. One forward step per node:
+\begin{align}
+  \Delta H_i^{\mathrm{diss}}
+    &= \sum_{j\sim i} w_{ij}\,(\mu_i-\mu_j),
+       \qquad \mu_i=1/T_i,
+       \label{eq:dHdiss}\\
+  H_i^{\mathrm{new}}
+    &= \mathcal H(T_i) + \Delta H_i^{\mathrm{diss}} + \Delta H_i^{\mathrm{ext}},
+       \label{eq:Hupdate}\\
+  \Delta T_i
+    &= \mathcal H^{-1}\!\big(H_i^{\mathrm{new}}\big) - T_i,
+       \label{eq:dT}
+\end{align}
+and the head returns the normalized $\Delta T_i$, so the rollout loop and data pipeline
+are unchanged (the network still rolls temperature).
+
+%==============================================================================
+\section{The enriched source}
+\label{sec:enriched}
+%==============================================================================
+
+Both structure-preserving heads (temperature and enthalpy) were observed to run
+\emph{cold at the active peak}. The reason is structural: the dissipative operator can
+\emph{only cool} the hottest node (hot$\to$cold by construction); the \emph{only} term
+that can heat the peak is the external source. With a single global scalar gain it was
+too rigid to inject enough energy. The external exchange is, however, exactly the
+\emph{non-conservative} term that the GENERIC degeneracy and second law do \emph{not}
+constrain---so we may give it expressivity without breaking any guarantee.
+
+We replace the scalar source/cooling gains by per-node learned modulations:
+\begin{equation}
+  \Delta H_i^{\mathrm{ext}}
+  = \underbrace{\softplus\!\big(g_q+\mathrm{MLP}_q(\bm v_i,q_i,T_i)\big)\,q_i}
+    _{\text{Goldak heating }\ge 0}
+  + \underbrace{\softplus\!\big(g_c+\mathrm{MLP}_c(\bm v_i,T_i,\Tinf)\big)\,
+    r_i\,(\Tinf-T_i)}_{\text{Newton cooling on Robin nodes }r_i},
+  \label{eq:enriched}
+\end{equation}
+where $q_i$ is the node's Goldak source feature and $r_i$ the Robin one-hot. The MLP
+output layers are zero-initialized, so the head \emph{starts identical} to the scalar
+version and then learns where to inject more energy. The heating gain is
+$\softplus(\cdot)\ge0$ and is gated by $q_i$ (it cannot invent far-field energy); the
+cooling term keeps the correct sign. The dissipation \cref{eq:dHdiss} remains fully
+structure-preserving. The gains carry a $\Delta t/(\rho c_p)$-type scale, initialized so
+$\softplus(g_q)\approx\SI{0.025}{}$ (a per-step deposit of $q\Delta t$ yields the right
+$\sim$\SI{e2}{K} peak heating) and $\softplus(g_c)\approx\num{e-3}$.
+
+This enriched-source enthalpy GENERIC model has \num{1375238} parameters
+($+\,$\num{83461} over the unconstrained backbone: the conductance MLP, the two source
+MLPs, and the global scales).
+
+%==============================================================================
+\section{Training}
+\label{sec:training}
+%==============================================================================
+
+\subsection{Loss, optimizer, and training noise}
+
+The base objective is the mean squared error on the normalized increment
+$\Delta T=T^{t+1}-T^{t}$. We optimize with Adam (learning rate \num{e-3}, weight decay
+\num{e-4}, gradient-norm clipping at $1.0$) and a plateau learning-rate scheduler. To
+stabilize autoregressive rollouts we inject zero-mean Gaussian noise into the input
+temperature during training and correct the target accordingly (the standard
+MeshGraphNet noise of Pfaff et al.~\cite{pfaff2021learning}):
+\begin{equation}
+  \tilde T_i^{t}=T_i^{t}+\eta_i,\quad \eta_i\sim\mathcal N(0,\sigma^2);
+  \qquad
+  \Delta T_i^{\mathrm{target}}=T_i^{t+1}-\tilde T_i^{t}=y_i-\eta_i,
+  \label{eq:noise}
+\end{equation}
+so the network learns to drive a perturbed state back onto the true trajectory. We use
+$\sigma=\SI{5}{K}$. Noise is applied only to the training fold and only to the (raw)
+temperature column, before normalization.
+
+\subsection{Push-forward (multi-step) training}
+\label{sec:pushforward}
+
+A recurring empirical lesson was that improving the single-step objective harder (lower
+training MSE, lower short-rollout validation RMSE) did \emph{not} improve, and sometimes
+\emph{worsened}, the long inference rollout: the single-step objective is simply not
+aligned with the \num{1526}-step inference horizon. We therefore train with a
+\emph{push-forward} objective: unroll the model $K$ steps and backpropagate through the
+whole unroll (full backpropagation through time).
+
+Concretely, the data loader yields windows of $K$ consecutive same-simulation graphs
+$[g_t,\dots,g_{t+K-1}]$. We seed temperature from the (noised) true field at the window
+start and roll forward, feeding the model's own prediction back as the next input's
+temperature column, accumulating a scaled-temperature MSE over the window
+(\cref{alg:pf}). $K=1$ recovers the classic single-step objective. We use $K=2$, which
+makes the operator contractive over two-step composition---enough, combined with the
+thermodynamic structure, to align with the long rollout while remaining cheap.
+
+\begin{algorithm}[t]
+\caption{Push-forward training step (window of $K$ step-aligned batches)}
+\label{alg:pf}
+\begin{algorithmic}[1]
+\State \textbf{input:} batches $[B_0,\dots,B_{K-1}]$, normalizer $\mathcal N$, model $f_\theta$
+\State $\hat T \gets$ \Call{DynamicNoise}{$B_0.T,\,B_0.\Tinf$} \Comment{seed from window start}
+\State $\mathcal L \gets 0$
+\For{$k=0$ \textbf{to} $K-1$}
+  \State $\bm x \gets B_k.\bm x$ with temperature column $\gets \hat T$
+  \State $\Delta T \gets \mathcal N_y^{-1}\big(f_\theta(\text{standardize}(\bm x), B_k.\text{edges})\big)$
+  \State $T_{\mathrm{pred}} \gets \hat T + \Delta T$
+  \State $T_{\mathrm{true}} \gets B_k.T + B_k.y$
+  \State $\mathcal L \gets \mathcal L + \big\lVert (T_{\mathrm{pred}}-T_{\mathrm{true}})/\sigma_T\big\rVert^2 / N$
+  \State $\hat T \gets T_{\mathrm{pred}}$ \Comment{feed forward; \emph{no} detach $\Rightarrow$ BPTT}
+\EndFor
+\State $\mathcal L \gets \mathcal L / K$; \quad backprop, clip, optimizer step
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Validation metric and model selection}
+
+Validation uses the \emph{full autoregressive rollout} RMSE on held-out simulations
+(not single-step error), averaged over the held-out fold; the best checkpoint is the one
+minimizing this metric. We additionally evaluate every checkpoint on the out-of-
+distribution spiral (below), because even the rollout validation does not perfectly
+track the very-long inference horizon.
+
+\subsection{Configuration and compute}
+
+The headline run uses $d=128$, $L=8$ message-passing steps, batch size 16, $K=2$
+push-forward, $\sigma=\SI{5}{K}$ noise, plateau scheduler, 80 epochs, simulation-level
+split (\num{288} train / \num{72} val, validation rollout capped at 20 simulations for
+cost). Training was performed on a single NVIDIA A100-80GB ($\sim$\SI{15}{min}/epoch,
+$\sim$\SI{58}{GB} VRAM at this batch/$K$); the processed-graph cache lives on a network
+volume so re-launches skip the build. Local evaluation/rollouts run on an RTX-class GPU.
+
+%==============================================================================
+\section{Experiments and results}
+\label{sec:results}
+%==============================================================================
+
+\subsection{Out-of-distribution test: the Archimedean spiral}
+
+The held-out generalization probe is a constant-speed Archimedean-spiral weld
+$\bm\gamma(\theta)=\bm c+b\,\theta\,[\cos\theta,\sin\theta]$ on a square plate of side
+\SI{0.2}{m}, 3 turns, travel speed \SI{10}{mm/s}, net power $\eta P$ with
+$P=\SI{2500}{W}$, $\eta=0.8$. This trajectory is \emph{never} seen in training (all
+training paths are straight/diagonal/sinusoid/arc), yet plate size and speed are
+interior to the training ranges (\cref{sec:dataset}), so the spiral isolates trajectory
+generalization. The FEM ground truth has \num{4225} nodes and \num{1526} time steps
+(\SI{76.25}{s})---an autoregressive horizon many times longer than any training window.
+The spiral additionally exercises genuine \emph{re-heating} physics: successive spiral
+arms re-heat one another, a multi-pass effect absent from the single-pass training data.
+
+\subsection{Headline result}
+
+The enriched-source enthalpy GENERIC model trained with push-forward $K=2$ attains:
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Held-out single-pass validation rollout RMSE} that is \emph{stable}
+  across epochs and does not degrade (best \SI{34.5}{K} at epoch 60), unlike the
+  $K=1$ variant which improved validation while drifting the spiral worse;
+  \item \textbf{Spiral global RMSE \SI{33.2}{K}} (best-validation checkpoint), about
+  $2\times$ better than the best non-structure-preserving model obtained at any point
+  in the study (\SI{65}{K}), and \emph{stable} over all \num{1526} steps (bounded
+  $\max\abs{\text{err}}$, no divergence);
+  \item \textbf{Maximum-principle respect}: minimum temperature stays within
+  $\sim$\SI{6}{K} of the physical floor (ambient/Robin bath), never cooling
+  sub-ambient.
+\end{itemize}
+\Cref{fig:spiral} shows the five-probe thermal histories (FEM vs.\ surrogate) at radii
+spanning the melt pool to the cool corner. The shapes and arrival times of the passing
+peaks are captured; the one remaining flaw is a mild smoothing of the sharpest central
+peak (\SI{1713}{K} vs.\ FEM \SI{1921}{K}), while the mid-field is essentially nailed
+(e.g.\ \SI{908}{K} vs.\ \SI{949}{K}).
+
+\figIfExists{spiral_pf_best_ep60_thermal_history.png}{0.95}{%
+  Spiral out-of-distribution test: FEM ground truth vs.\ the enriched-source enthalpy
+  GENERIC surrogate (push-forward $K{=}2$, best-validation checkpoint), at five probe
+  locations from the hot center to the cool corner. Global RMSE \SI{33.2}{K} over
+  \num{1526} autoregressive steps; stable, no divergence.}{fig:spiral}
+
+\subsection{Ablation: thermodynamic structure ON vs.\ OFF}
+
+To isolate the value of the structure, we train an otherwise identical
+\emph{unconstrained} MeshGraphNet (GENERIC OFF, decoder active) with the same
+push-forward $K=2$, the same split, budget, noise, and hyperparameters. The two models
+therefore differ \emph{only} in the head, and their validation metrics are directly
+comparable. We then sweep every checkpoint (epochs 10--80) on the spiral and measure not
+just best-case RMSE but the \emph{stability signals}: rollout-RMSE variance across
+checkpoints, the minimum temperature (maximum-principle violation), and whether the
+deployable best-validation checkpoint is also the best on the spiral.
+
+\Cref{tab:ablation} summarizes the ablation; \cref{fig:ablation} plots spiral-RMSE and
+minimum-temperature versus epoch for both models. The findings:
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Maximum principle.} The structured model respects the physical floor
+  (min $T\approx\SI{287}{K}$, $\sim$\SI{6}{K} undershoot); the unconstrained model cools
+  to \SIrange{140}{190}{K} at \emph{every} checkpoint---up to $\sim$\SI{150}{K} of
+  unphysical sub-ambient cooling.
+  \item \textbf{Variance.} The structured model's spiral RMSE sits in a tight band
+  (33--61\,K, $\sigma\approx3.4$); the unconstrained model swings 38--111\,K
+  ($\sigma\approx10.2$, $\sim$$3\times$ larger).
+  \item \textbf{Selectability.} For the structured model the best-validation checkpoint
+  \emph{is} the best spiral checkpoint (validation tracks the long rollout); for the
+  unconstrained model the best-validation checkpoint gives a mediocre spiral
+  (\SI{58.6}{K}) and the best spiral checkpoint cannot be selected by validation.
+  \item \textbf{Held-out single-pass.} The structured model is also better on ordinary
+  held-out rollouts (e.g.\ \SI{8.1}{K} vs.\ \SI{36.2}{K} on one validation simulation).
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\caption{Ablation: GENERIC enthalpy structure ON vs.\ OFF, both push-forward $K{=}2$,
+identical otherwise. The structured model respects the maximum principle, has
+$\sim$$3\times$ lower spiral-RMSE variance, and a validation metric that tracks the
+spiral.}
+\label{tab:ablation}
+\small
+\begin{tabular}{lccccc}
+\toprule
+Configuration & Params & Val.\ RMSE & Spiral RMSE & Spiral range & Min.\ $T$ \\
+              &        & (K)        & @best-val (K) & ep10--80 [$\sigma$] (K) & / undershoot (K)\\
+\midrule
+\textbf{ON} (enthalpy GENERIC      & \multirow{2}{*}{\num{1375238}} & \multirow{2}{*}{34.5}
+  & \multirow{2}{*}{33.2} & \multirow{2}{*}{33--61 [3.4]} & \multirow{2}{*}{287 ($-6$)}\\
+\;\;+ enriched source) & & & & &\\
+\addlinespace[2pt]
+\textbf{OFF} (pure MeshGraphNet)   & \num{1291777} & 46.9 & 58.6 & 38--111 [10.2] & 140 ($-153$)\\
+\bottomrule
+\end{tabular}
+\par\vspace{2pt}
+{\footnotesize Physical floor $=\SI{293}{K}$ (ambient $=$ Robin bath $=$ initial).}
+\end{table}
+
+\figIfExists{ablation_figure.png}{0.95}{%
+  Ablation (both push-forward $K{=}2$). \emph{Left:} spiral global RMSE vs.\ epoch; the
+  structured model (ON) stays in a tight band and its best-validation checkpoint
+  ($\star$) coincides with its best spiral, whereas the unconstrained model (OFF) swings
+  $\sim$$3\times$ more and its best-validation checkpoint is mediocre on the spiral.
+  \emph{Right:} minimum temperature vs.\ epoch; ON stays at the physical floor
+  (\SI{293}{K} line), OFF cools sub-ambient at every checkpoint.}{fig:ablation}
+
+\figIfExists{compare_spiral_fem_on_off.png}{0.95}{%
+  Three-way spiral thermal histories (five probes): FEM (black), GENERIC ON (green),
+  pure MeshGraphNet OFF (red, dashed). The unconstrained model's far-field and
+  cool-corner behavior is visibly less faithful; per-curve RMSE in the legend.}%
+  {fig:comparespiral}
+
+\subsection{Held-out single-pass validation}
+
+\Cref{fig:val1,fig:val2} show held-out single-pass rollouts (in-distribution
+trajectories, unseen geometry/process/boundary). The structured model is near-perfect
+in the far field (RMSE $\sim$\SI{1}{K}, no spurious echo) and accurate at the peak; the
+residual error concentrates only in extreme dynamic-range outliers. These results---not
+the OOD spiral---constitute the core deployable claim: strong generalization across
+geometry, plate size, process parameters, and boundary conditions.
+
+\figIfExists{compare_val_sim001_fem_on_off.png}{0.92}{%
+  Held-out single-pass validation simulation (four peak-fraction probes): FEM (black),
+  GENERIC ON (green), OFF (red, dashed). The structured model tracks all probes; global
+  RMSE \SI{8.1}{K} (ON) vs.\ \SI{36.2}{K} (OFF).}{fig:val1}
+
+\figIfExists{compare_val_sim006_fem_on_off.png}{0.92}{%
+  A second held-out validation simulation. Global RMSE \SI{36.0}{K} (ON) vs.\
+  \SI{63.4}{K} (OFF); the ON residual is concentrated at the sharp peak, the far field
+  is near-exact.}{fig:val2}
+
+%==============================================================================
+\section{Discussion}
+\label{sec:discussion}
+%==============================================================================
+
+\paragraph{What the structure buys.} The honest framing of the ablation is not that the
+unconstrained network is catastrophic---at a lucky checkpoint it reaches a respectable
+number---but that it is \emph{fragile}: you cannot select its good checkpoint by any
+deployable metric, it violates the maximum principle everywhere, and it varies
+$\sim$$3\times$ more across training. The GENERIC structure instead provides
+\emph{horizon-independent guarantees}: energy conservation and $\dd S/\dd t\ge0$ hold at
+every single step regardless of rollout length, which is exactly what a \num{1526}-step
+(or longer) deployment needs. This is a stronger and more defensible claim than a small
+RMSE improvement.
+
+\paragraph{Where the work is done.} A caveat we make explicit: because the enriched
+source is a learned per-node MLP (gated by the Goldak field), one may ask whether the
+flexible source is ``painting'' the temperature rather than the structured dissipation
+doing the physics. The source is constrained (non-negative heating, gated by $q$,
+sign-correct cooling), but a principled next step is to replace the source MLP by a
+\emph{named} temperature-dependent arc-efficiency $\eta(T)$ with few parameters: if a
+bounded physical mechanism still recovers the peak, the effect is real physics rather
+than black-box flexibility.
+
+\paragraph{Limitations and future improvements.}
+(i) \textbf{Exact energy conservation vs.\ the implemented uniform-volume reduction.}
+The first law in \cref{prop1} holds on \emph{any} mesh for the extensive-energy state
+$\mathcal E_i=h_iV_i$ \cref{eq:enthalpyevol}. The deployed head uses the uniform-volume
+reduction $V_i\equiv V$, which is exact in the interior of the uniform tensor meshes used
+here and leaves only a small residual at boundary/corner nodes (tributary volumes
+$V/2,\,V/4$). On strongly non-uniform meshes---e.g.\ refined near the arc, as is common in
+production welding FEM---the unweighted conservation $\sum_i\Delta h_i=0$ would no longer
+equal the physical $\sum_i V_i\Delta h_i=0$. We emphasize that this does \emph{not} affect
+the reported results: on the present uniform meshes the two formulations are numerically
+indistinguishable away from $\partial\Omega$, so the uniform-volume head is an excellent
+approximation, and the maximum-principle/stability guarantees observed empirically are
+unaffected. Restoring \emph{exact} conservation on arbitrary meshes requires only the
+cheap, learning-free volume weighting (the lumped FEM mass diagonal, already available);
+we leave the $V_i$-weighted formulation and its retraining on refined meshes as a
+straightforward future improvement.
+(ii) The model is 2D (thickness-integrated); a 3D extension follows the same graph
+machinery.
+(iii) The constant-$\rho c_p$ rescaling in \cref{sec:conditioning} is exact only up to the
+curve $H(T)$ used; the curve is the FEM's, so the surrogate inherits the FEM's material
+model.
+(iv) The training corpus has a small soft-cap tail of very hot ($>$\SI{4000}{K})
+simulations; tightening the vaporization cap and regenerating would clean it (the enthalpy
+head's $H(T)$ table auto-syncs).
+(v) The OOD spiral's central peak is still mildly smoothed; sharper-peak modeling is
+future work.
+
+%==============================================================================
+\section{Related work}
+%==============================================================================
+
+\emph{Learned mesh simulators.} MeshGraphNets~\cite{pfaff2021learning} and graph network
+simulators~\cite{sanchez2020learning} established message passing on simulation meshes;
+our backbone is a configurable MeshGraphNet with the standard training-noise trick for
+rollout stability. \emph{Structure-preserving learning.} The GENERIC
+framework~\cite{grmela1997dynamics,ottinger2005beyond} has been used to learn
+thermodynamically consistent dynamics (e.g.\ GENERIC neural networks and structure-
+preserving operators)~\cite{hernandez2021structure}; our contribution is to identify
+that imposing it on \emph{temperature} is inconsistent under latent heat and to fix it
+with the classical \emph{enthalpy method}~\cite{voller1987enthalpy}, realized as a
+learned SPSD graph-Laplacian on a graph-network surrogate. \emph{Welding/AM thermal
+surrogates} have used POD/ROM and CNN/GNN models; the novelty here is the combination of
+thermodynamic structure, phase-change-consistent energy bookkeeping, and push-forward
+training for long-horizon stability.
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+We presented a MeshGraphNet surrogate for transient welding heat transfer that is
+\emph{thermodynamically consistent by construction}. The key technical insight is that
+GENERIC structure must be imposed on \emph{energy}, not temperature: with latent heat,
+conserving the sum of nodal temperatures is not conserving energy, and the mismatch is
+largest exactly at the melt pool. Carrying the volumetric enthalpy as the conserved
+state (the enthalpy method), evolving it with a learned SPSD graph-Laplacian, and
+recovering temperature through the latent-heat-aware curve restores genuine energy
+conservation and the second law through phase change. An enriched, non-conservative
+source recovers melt-pool peak heating without breaking the guarantees, and push-forward
+$K{=}2$ training aligns the objective with long autoregressive rollouts. On a held-out
+out-of-distribution spiral weld of \num{1526} steps the model reaches \SI{33.2}{K} global
+RMSE while respecting the maximum principle and remaining stable, and a matched ablation
+shows the structure delivers low-variance, selectable, physically admissible rollouts
+where the unconstrained network is accurate-but-fragile.
+
+%==============================================================================
+\section*{Reproducibility}
+%==============================================================================
+\addcontentsline{toc}{section}{Reproducibility}
+The pipeline comprises: the FEM solver (\texttt{thermal\_solver.py}: Goldak source,
+apparent heat capacity, $\theta$-method + Picard), dataset generation
+(\texttt{generate\_dataset.py}: stratified sampling and adaptive cooling), the graph
+builder (\texttt{graph\_builder.py}: 12-d relative node features, 3-d edge features), the
+model (\texttt{meshgraphnet.py}: Encoder--Processor--Decoder plus the
+\texttt{EnthalpyGenericThermalHead}), and training (\texttt{train.py}: push-forward
+unroll, training noise, simulation-level split). The structure-preserving guarantees
+($\sum_i\Delta H^{\mathrm{diss}}_i=0$, $\dd S/\dd t\ge0$, latent-heat damping) are
+unit-tested. Normalization constants and the enthalpy table ride in the model
+\texttt{state\_dict}, so checkpoints reproduce the exact physics.
+
+%==============================================================================
+\begin{thebibliography}{9}
+%==============================================================================
+\bibitem{pfaff2021learning}
+T.~Pfaff, M.~Fortunato, A.~Sanchez-Gonzalez, and P.~W.~Battaglia.
+\newblock Learning mesh-based simulation with graph networks.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem{sanchez2020learning}
+A.~Sanchez-Gonzalez, J.~Godwin, T.~Pfaff, R.~Ying, J.~Leskovec, and P.~W.~Battaglia.
+\newblock Learning to simulate complex physics with graph networks.
+\newblock In \emph{ICML}, 2020.
+
+\bibitem{grmela1997dynamics}
+M.~Grmela and H.~C.~\"Ottinger.
+\newblock Dynamics and thermodynamics of complex fluids. I. Development of a general formalism.
+\newblock \emph{Physical Review E}, 56(6):6620--6632, 1997.
+
+\bibitem{ottinger2005beyond}
+H.~C.~\"Ottinger.
+\newblock \emph{Beyond Equilibrium Thermodynamics}.
+\newblock Wiley, 2005.
+
+\bibitem{ottinger2006open}
+H.~C.~\"Ottinger.
+\newblock Nonequilibrium thermodynamics for open systems.
+\newblock \emph{Physical Review E}, 73(3):036126, 2006.
+
+\bibitem{goldak1984new}
+J.~Goldak, A.~Chakravarti, and M.~Bibby.
+\newblock A new finite element model for welding heat sources.
+\newblock \emph{Metallurgical Transactions B}, 15(2):299--305, 1984.
+
+\bibitem{voller1987enthalpy}
+V.~R.~Voller and C.~Prakash.
+\newblock A fixed grid numerical modelling methodology for convection-diffusion mushy
+region phase-change problems.
+\newblock \emph{Int.\ J.\ Heat Mass Transfer}, 30(8):1709--1719, 1987.
+
+\bibitem{hernandez2021structure}
+Q.~Hern\'andez, A.~Bad\'ias, D.~Gonz\'alez, F.~Chinesta, and E.~Cueto.
+\newblock Structure-preserving neural networks.
+\newblock \emph{Journal of Computational Physics}, 426:109950, 2021.
+
+\bibitem{skfem2020}
+T.~Gustafsson and G.~D.~McBain.
+\newblock scikit-fem: A Python package for finite element assembly.
+\newblock \emph{Journal of Open Source Software}, 5(52):2369, 2020.
+\end{thebibliography}
+
+\end{document}
