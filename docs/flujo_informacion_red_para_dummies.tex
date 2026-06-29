@@ -1,0 +1,565 @@
+%==============================================================================
+%  FLUJO DE INFORMACIÓN EN LA RED — PASO A PASO (PARA DUMMIES)
+%  Qué entra y qué sale en cada etapa, con las FORMAS (shapes) de los tensores:
+%  datos FEM -> grafos -> normalización -> MPNN -> head GENERIC -> ΔT -> loss.
+%
+%  Documento hermano de:
+%   - generic_entalpico_para_dummies.tex          (QUÉ y POR QUÉ, la formulación)
+%   - implementacion_pytorch_para_dummies.tex     (CÓMO en código, file:line)
+%  Éste responde: ¿por dónde viaja la información y con qué forma?
+%==============================================================================
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\usepackage[hidelinks,unicode]{hyperref}
+
+% --- macros -------------------------------------------------------------------
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\Lw}{\bm{L}_{w}}
+\newcommand{\Tinf}{T_{\infty}}
+\newcommand{\cpsens}{c_p^{\mathrm{sens}}}
+\newcommand{\shp}[1]{{\color{shapecol}\texttt{(#1)}}}   % anotación de forma
+
+\definecolor{shapecol}{rgb}{0.62,0.18,0.18}
+\definecolor{nnblue}{rgb}{0.20,0.40,0.70}
+\definecolor{physgray}{rgb}{0.92,0.92,0.88}
+\definecolor{datacol}{rgb}{0.15,0.45,0.30}
+
+% cajas pedagógicas
+\theoremstyle{definition}
+\newtheorem{idea}{Idea clave}[section]
+
+\newcommand{\dummies}[1]{%
+  \par\smallskip\noindent
+  \colorbox{yellow!18}{\parbox{\dimexpr\linewidth-2\fboxsep}{%
+  \small\textbf{En cristiano:} #1}}\par\smallskip}
+
+% caja "entrada -> proceso -> salida"
+\newcommand{\io}[3]{%
+  \par\smallskip\noindent
+  \colorbox{blue!6}{\parbox{\dimexpr\linewidth-2\fboxsep}{\small
+  \textbf{Entra:} #1 \\ \textbf{Hace:} #2 \\ \textbf{Sale:} #3}}\par\smallskip}
+
+\tikzset{
+  stage/.style={rounded corners=2pt, draw=nnblue!80, fill=nnblue!12,
+                line width=0.7pt, align=center, inner sep=5pt, font=\small,
+                text width=3.1cm},
+  phys/.style={rounded corners=2pt, draw=black!45, fill=physgray,
+               line width=0.6pt, align=center, inner sep=5pt, font=\small,
+               text width=3.1cm},
+  data/.style={align=center, font=\footnotesize\itshape, text=datacol},
+  slbl/.style={font=\scriptsize\ttfamily, text=shapecol},
+  ar/.style={-{Latex[length=2mm]}, line width=0.8pt, draw=black!70},
+}
+
+\title{\bfseries El flujo de información en la red, paso a paso\\[3pt]
+  \large Qué entra y qué sale en cada etapa, con las formas de los tensores\\
+  (datos FEM $\to$ grafos $\to$ MPNN $\to$ GENERIC $\to$ $\Delta T$ $\to$ \emph{loss})}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Este documento traza, \textbf{como con lápiz y papel}, el camino que recorre la
+información dentro de nuestra arquitectura: desde una simulación FEM hasta la
+pérdida que entrena la red. En cada etapa decimos exactamente \textbf{qué entra},
+\textbf{qué se hace} y \textbf{qué sale}, anotando la \textbf{forma (shape)} de cada
+tensor (en \shp{rojo}). Usamos un \textbf{ejemplo de juguete} (una malla de
+$N{=}4$ nodos) para que las formas sean concretas. No se asume nada de los otros
+documentos; aquí solo importa ``¿por dónde va el dato y con qué forma?''.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==============================================================================
+\section{Notación y ejemplo de juguete}
+\label{sec:notacion}
+%==============================================================================
+
+Símbolos que usaremos para las \textbf{dimensiones}:
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Símbolo & Significado & En el ejemplo de juguete \\
+\midrule
+$N$ & nº de \textbf{nodos} de la malla & $N=4$ \\
+$E$ & nº de \textbf{aristas} no dirigidas & $E=5$ \\
+$2E$ & aristas \textbf{dirigidas} (ambos sentidos) & $2E=10$ \\
+$S$ & nº de \textbf{fotogramas} temporales de la sim & p.ej. $S=350$ \\
+$d$ & ancho de la \textbf{latente} (\texttt{hidden\_dim}) & $d=128$ \\
+$L$ & nº de bloques del \textbf{Processor} & $L=8$ \\
+$K$ & pasos del \textbf{push-forward} (multi-step) & $K=2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Ejemplo de juguete.} Una placa cuadrada partida en 2 triángulos:
+$N{=}4$ nodos, $E{=}5$ aristas (4 lados + 1 diagonal), $2E{=}10$ dirigidas.
+Mantendremos estos números entre corchetes para que veas las formas \emph{con
+números}. En la realidad $N$ es de cientos a miles y varía por simulación.
+
+\begin{center}
+\begin{tikzpicture}[scale=1.5]
+  \node[circle,draw,fill=blue!10,inner sep=1.5pt] (n0) at (0,0) {\scriptsize 0};
+  \node[circle,draw,fill=blue!10,inner sep=1.5pt] (n1) at (1,0) {\scriptsize 1};
+  \node[circle,draw,fill=blue!10,inner sep=1.5pt] (n2) at (1,1) {\scriptsize 2};
+  \node[circle,draw,fill=blue!10,inner sep=1.5pt] (n3) at (0,1) {\scriptsize 3};
+  \draw (n0)--(n1)--(n2)--(n3)--(n0); \draw (n0)--(n2);
+  \node[font=\scriptsize, text=datacol] at (1.8,0.5)
+    {$N{=}4,\ E{=}5,\ 2E{=}10$};
+\end{tikzpicture}
+\end{center}
+
+\dummies{Cada ``shape'' \shp{filas, columnas} dice cuántos números hay. \shp{4, 12}
+$=$ 4 nodos, 12 features por nodo. Si te pierdes, mira siempre la forma: te dice qué
+representa el tensor.}
+
+%==============================================================================
+\section{Vista de pájaro: el camino completo}
+\label{sec:overview}
+%==============================================================================
+
+Antes del detalle, el mapa entero con las formas en cada flecha (ejemplo de
+juguete, \textbf{un} par de fotogramas):
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[node distance=6.5mm and 9mm]
+  \node[phys] (fem) {\textbf{Sim.\ FEM}\\ campos $T(t)$};
+  \node[stage, right=of fem] (graph) {\textbf{Grafo}\\ features};
+  \node[stage, right=of graph] (norm) {\textbf{Normaliza}\\ z-score};
+  \node[stage, right=of norm] (mpnn) {\textbf{MPNN}\\ enc--proc};
+  \node[phys, right=of mpnn] (gen) {\textbf{GENERIC}\\ entálpico};
+  \node[stage, right=of gen] (loss) {$\Delta T$ \&\\ \textbf{loss}};
+
+  \draw[ar] (fem) -- node[slbl,above]{T:\,(4,)} (graph);
+  \draw[ar] (graph) -- node[slbl,above]{x:\,(4,12)} node[slbl,below]{e:\,(10,3)} (norm);
+  \draw[ar] (norm) -- node[slbl,above]{(4,12)} (mpnn);
+  \draw[ar] (mpnn) -- node[slbl,above]{v:\,(4,128)} (gen);
+  \draw[ar] (gen) -- node[slbl,above]{$\Delta T$:\,(4,1)} (loss);
+\end{tikzpicture}}
+\end{center}
+
+Las siguientes secciones abren cada caja. La regla de oro: \textbf{el número de
+filas casi siempre es $N$} (una fila por nodo) o $2E$ (una por arista); lo que cambia
+es el número de \emph{columnas} (de 12 features crudas, a 128 latentes, a 1 que es
+$\Delta T$).
+
+%==============================================================================
+\section{Etapa 0 — Los datos: una simulación FEM}
+\label{sec:datos}
+%==============================================================================
+
+El dato de partida es una \textbf{simulación FEM} ya resuelta (un objeto
+\texttt{SimulationResult} guardado en \texttt{.npz}). Contiene la película térmica y
+todo lo necesario para reconstruir las features:
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Campo & Forma & Qué es \\
+\midrule
+\texttt{coords}          & \shp{N, 2}  & posición $(x,y)$ de cada nodo \\
+\texttt{cells}           & \shp{M, 3}  & los 3 nodos de cada triángulo \\
+\texttt{times}           & \shp{S,}    & instante de cada fotograma \\
+\texttt{temperature}     & \shp{S, N}  & \textbf{temperatura de cada nodo en cada instante} \\
+\texttt{source\_position}& \shp{S, 2}  & posición de la antorcha en cada instante \\
+\texttt{source\_power}   & \shp{S,}    & potencia del arco (0 cuando se apaga) \\
+\texttt{metadata}        & dict        & Goldak, contornos, geometría/trayectoria \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\io{nada (es el punto de partida): una placa, unos parámetros de proceso.}
+{el solver FEM resuelve la ecuación del calor instante a instante.}
+{\texttt{temperature} \shp{S, N}: la película de temperaturas (la ``verdad'').}
+
+\dummies{Una simulación $=$ una película. \texttt{temperature[t]} es la foto del
+instante $t$: la temperatura de los $N$ nodos. Hay $S$ fotos. De aquí saldrán
+$S{-}1$ ejemplos de entrenamiento (un par de fotos consecutivas cada uno).}
+
+%==============================================================================
+\section{Etapa 1 — De la simulación FEM a grafos}
+\label{sec:grafos}
+%==============================================================================
+
+Cada \textbf{par de fotogramas consecutivos} $(t,t{+}1)$ se convierte en
+\textbf{un grafo}. Una simulación de $S$ fotos da $S{-}1$ grafos. Cada grafo lleva
+cuatro cosas:
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Tensor del grafo & Forma & Qué es \\
+\midrule
+\texttt{x}          & \shp{N, 12} & 12 \textbf{features} por nodo, estado en $t$ \\
+\texttt{edge\_index}& \shp{2, 2E} & qué nodo conecta con qué nodo (emisor, receptor) \\
+\texttt{edge\_attr} & \shp{2E, 3} & 3 features por arista dirigida \\
+\texttt{y}          & \shp{N, 1}  & \textbf{objetivo}: $\Delta T = T^{t+1}-T^{t}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Las 12 features de nodo} (orden fijo). Solo información \emph{relativa}:
+nada de coordenadas absolutas.
+\begin{center}\small
+\begin{tabular}{@{}clp{0.52\linewidth}@{}}
+\toprule
+\# & Nombre & Qué es \\
+\midrule
+0  & \texttt{T}            & temperatura actual del nodo \ \textbf{(la única que se realimenta)} \\
+1  & \texttt{q\_goldak}    & fuente del arco evaluada en el nodo (0 al enfriar) \\
+2,3& \texttt{dx,dy\_local} & posición del nodo relativa a la antorcha (marco tangente/normal) \\
+4  & \texttt{net\_power}   & potencia neta $\eta P$ (constante por sim) \\
+5  & \texttt{speed}        & velocidad de soldadura \\
+6,7,8 & \texttt{bc\_*}     & one-hot del tipo de nodo (interior/Dirichlet/Robin) \\
+9  & \texttt{h\_conv}      & coef.\ de convección local \\
+10 & \texttt{emissivity}   & emisividad local \\
+11 & \texttt{T\_inf}       & temperatura ambiente local \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Las 3 features de arista:} $[\,\Delta x,\ \Delta y,\ \lVert\bm u_{ij}\rVert\,]$
+con $\bm u_{ij}=\bm x_i-\bm x_j$ (el desplazamiento entre los dos nodos). La geometría
+entra \emph{solo} por aquí.
+
+\paragraph{Aristas bidireccionales.} Cada arista de la malla se mete en
+\textbf{los dos sentidos}: por eso \texttt{edge\_index} tiene $2E$ columnas. La fila 0
+son los emisores $i$, la fila 1 los receptores $j$.
+
+\io{una \texttt{SimulationResult} (la película FEM).}
+{para cada $t$: monta las 12 features por nodo, las 3 por arista, y la resta
+$T^{t+1}-T^{t}$.}
+{una lista de $S{-}1$ grafos, cada uno con \texttt{x}\,\shp{N,12},
+\texttt{edge\_index}\,\shp{2,2E}, \texttt{edge\_attr}\,\shp{2E,3}, \texttt{y}\,\shp{N,1}.}
+
+\begin{idea}[El objetivo es $\Delta T$, no $T$]
+La red \textbf{no} predice la temperatura nueva directamente: predice el
+\textbf{incremento} $\Delta T=T^{t+1}-T^{t}$ \shp{N,1}. Luego se suma:
+$T^{t+1}=T^{t}+\Delta T$. Predecir el cambio (pequeño) es más fácil y estable que
+predecir el valor absoluto.
+\end{idea}
+
+\dummies{Un grafo $=$ una foto ($N$ nodos $\times$ 12 números) $+$ la respuesta
+correcta ($\Delta T$ por nodo). Las aristas dicen quién es vecino de quién y a qué
+distancia. Eso es \emph{todo} lo que ve la red.}
+
+%==============================================================================
+\section{Etapa 2 — Normalización}
+\label{sec:norm}
+%==============================================================================
+
+Las redes entrenan mejor si las entradas tienen media 0 y desviación 1. Se calcula la
+media y la desviación de cada columna \emph{sobre todo el corpus} (se guardan en
+\texttt{stats.pt}) y se aplica un \textbf{z-score}:
+\[
+  x_{\text{norm}}[:,c] = \frac{x[:,c]-\mu_c}{\sigma_c}.
+\]
+Detalles que importan:
+\begin{itemize}[leftmargin=1.4em]
+  \item Las \textbf{columnas one-hot} (6,7,8) \emph{no} se tocan (ya son 0/1).
+  \item Las \texttt{edge\_attr} se pasan \textbf{crudas} (sin normalizar).
+  \item El objetivo \texttt{y} también se normaliza para la pérdida; al predecir se
+  des-normaliza con \texttt{inverse\_y}.
+\end{itemize}
+
+\io{\texttt{x}\,\shp{N,12} crudas (kelvin, etc.).}
+{resta la media y divide por la desviación, columna a columna (menos los one-hot).}
+{\texttt{x\_norm}\,\shp{N,12} (mismas dimensiones, ahora adimensional).}
+
+\dummies{La forma \textbf{no cambia} \shp{N,12}: solo cambian los \emph{valores}
+(pasan a ``cuántas desviaciones por encima de la media''). Las constantes $\mu,\sigma$
+se guardan con el modelo, así que en inferencia se aplica la misma transformación.}
+
+%==============================================================================
+\section{Etapa 3 — El MPNN (Encoder + Processor)}
+\label{sec:mpnn}
+%==============================================================================
+
+El MeshGraphNet tiene tres partes; aquí usamos Encoder y Processor (el Decoder se
+\emph{omite} en nuestro modelo, lo sustituye el head GENERIC, §\ref{sec:gen}).
+
+\subsection{Encoder: subir a la latente}
+Dos MLPs independientes llevan las features crudas al espacio latente de ancho
+$d{=}128$:
+\[
+  \underbrace{\texttt{x\_norm}}_{\shp{N,12}}\ \xrightarrow{\ \text{MLP nodo}\ }\
+  \underbrace{\bm v}_{\shp{N,128}},
+  \qquad
+  \underbrace{\texttt{edge\_attr}}_{\shp{2E,3}}\ \xrightarrow{\ \text{MLP arista}\ }\
+  \underbrace{\bm\epsilon}_{\shp{2E,128}}.
+\]
+\io{\texttt{x\_norm}\,\shp{N,12} y \texttt{edge\_attr}\,\shp{2E,3}.}
+{cada MLP expande sus features a 128 dimensiones.}
+{latentes de nodo $\bm v$\,\shp{N,128} y de arista $\bm\epsilon$\,\shp{2E,128}.}
+
+\subsection{Processor: $L{=}8$ pasos de mensajes}
+Es el corazón. Se repiten $L{=}8$ \textbf{bloques}. En cada bloque pasan 3 cosas
+(con conexiones \emph{residuales}: se suma la entrada):
+
+\begin{center}
+\begin{tikzpicture}[node distance=5mm and 14mm]
+  \node[stage,text width=3.4cm] (e1) {\textbf{1) Update de arista}\\
+     $\bm\epsilon \mathrel{+}= \mathrm{MLP}_e([\bm\epsilon,\bm v_i,\bm v_j])$};
+  \node[stage,text width=3.4cm, right=of e1] (e2) {\textbf{2) Agregar}\\
+     $\bm m_j=\!\!\sum_{i\to j}\!\bm\epsilon_{ij}$ \ (\texttt{scatter} suma)};
+  \node[stage,text width=3.4cm, right=of e2] (e3) {\textbf{3) Update de nodo}\\
+     $\bm v_j \mathrel{+}= \mathrm{MLP}_v([\bm v_j,\bm m_j])$};
+  \draw[ar] (e1) -- node[slbl,above]{(2E,128)} (e2);
+  \draw[ar] (e2) -- node[slbl,above]{(N,128)} (e3);
+\end{tikzpicture}
+\end{center}
+
+Las formas dentro de un bloque:
+\begin{itemize}[leftmargin=1.4em]
+  \item Update de arista: la entrada del MLP es $[\bm\epsilon_{ij},\bm v_i,\bm v_j]$,
+  o sea \shp{2E, 384} ($=128{+}128{+}128$) $\to$ \shp{2E,128}.
+  \item Agregación: \texttt{scatter} suma, en cada nodo receptor, los mensajes de sus
+  aristas: \shp{2E,128} $\to$ \shp{N,128}. \emph{Aquí} es donde la información salta
+  de un nodo a sus vecinos.
+  \item Update de nodo: la entrada del MLP es $[\bm v_j,\bm m_j]$, \shp{N,256} $\to$
+  \shp{N,128}.
+\end{itemize}
+Tras $L{=}8$ bloques, la información de cada nodo ha viajado hasta \textbf{8 aristas}
+de distancia (el ``radio de visión'' alrededor del arco).
+
+\io{$\bm v$\,\shp{N,128}, $\bm\epsilon$\,\shp{2E,128}, \texttt{edge\_index}\,\shp{2,2E}.}
+{8 rondas de: actualizar aristas, sumar mensajes en los receptores, actualizar nodos.}
+{\textbf{latentes de nodo} $\bm v$\,\shp{N,128} (ricas en contexto local). Es lo que
+consume el head GENERIC.}
+
+\begin{idea}[El número que importa al salir del MPNN]
+Sale $\bm v$\,\shp{N,128}: \textbf{un vector de 128 números por nodo}. No es todavía
+una temperatura ni un $\Delta T$; es un ``resumen aprendido'' del estado de cada nodo
+y su entorno. La etapa siguiente lo convierte en física.
+\end{idea}
+
+\dummies{\texttt{scatter} $=$ ``por cada nodo, suma lo que le llega de sus aristas''.
+Repetido 8 veces, mezcla la información del vecindario. Entra \shp{N,12}, sale
+\shp{N,128}: más columnas $=$ más contexto por nodo, todavía sin unidades físicas.}
+
+%==============================================================================
+\section{Etapa 4 — El head GENERIC entálpico}
+\label{sec:gen}
+%==============================================================================
+
+Aquí las latentes se convierten en un $\Delta T$ que \textbf{respeta la física}. El
+head recibe tres cosas: las latentes $\bm v$\,\shp{N,128}, la conectividad
+\texttt{edge\_index}\,\shp{2,2E}, y las features crudas \texttt{x}\,\shp{N,12} (de
+donde saca la \textbf{temperatura física} $T$, la fuente $q$, el ambiente $\Tinf$).
+
+\begin{center}
+\begin{tikzpicture}[node distance=5mm and 8mm]
+  \node[stage,text width=3.0cm] (cond) {\textbf{Conductancias}\\
+     $w_{ij}=\mathrm{softplus}(\mathrm{MLP})$};
+  \node[phys,text width=2.5cm, right=of cond] (lap) {\textbf{Laplaciana}\\
+     $\Delta h_{\mathrm{dis}}=\Lw\bm\mu$};
+  \node[phys,text width=2.6cm, right=of lap] (ext) {\textbf{+ externo}\\
+     $\Delta h_{\mathrm{ext}}$};
+  \node[phys,text width=2.8cm, right=of ext] (inv) {\textbf{Tabla entalpía}\\
+     $T_{\text{new}}=h^{-1}(\cdot)$};
+  \draw[ar] (cond) -- node[slbl,above]{(2E,1)} (lap);
+  \draw[ar] (lap) -- node[slbl,above]{(N,1)} (ext);
+  \draw[ar] (ext) -- node[slbl,above]{(N,1)} (inv);
+\end{tikzpicture}
+\end{center}
+
+Paso a paso, con formas:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Temperatura física.} Des-normaliza la columna 0:
+  $T$\,\shp{N,1} en kelvin. La fuerza termodinámica es $\bm\mu=1/T$\,\shp{N,1}.
+  \item \textbf{Conductancias aprendidas.} Por cada arista, un MLP recibe features
+  \emph{simétricas} de sus dos extremos
+  $[\bm v_i{+}\bm v_j,\ (\bm v_i{-}\bm v_j)^2,\ T_i{+}T_j,\ |T_i{-}T_j|]$
+  \shp{2E, 258} y saca un escalar no negativo
+  $w_{ij}=w_{ji}\ge0$\,\shp{2E,1}. (Esta es la \emph{única} parte aprendida del head.)
+  \item \textbf{Disipación (Laplaciana).} Por cada arista $i{\to}j$ se aporta
+  $w_{ij}(\mu_j-\mu_i)$ al receptor y se suma con \texttt{scatter}:
+  $\Delta h_{\mathrm{dis}}$\,\shp{N,1}. Su suma por grafo es \textbf{cero}
+  $\Rightarrow$ conserva energía (1.er principio). El calor va de caliente a frío
+  por construcción.
+  \item \textbf{Término externo.} Aporte del arco (Goldak) y enfriamiento por los
+  bordes: $\Delta h_{\mathrm{ext}}$\,\shp{N,1}.
+  \item \textbf{Recuperar la temperatura por la tabla de entalpía.} Dos
+  interpolaciones contra la curva tabulada $H(T)$ (que lleva el calor latente):
+  \[
+    H_{\text{cur}} = H(T)\ \shp{N,1},\quad
+    T_{\text{new}} = H^{-1}\!\big(H_{\text{cur}}+\Delta h_{\mathrm{dis}}+\Delta h_{\mathrm{ext}}\big)\ \shp{N,1},
+  \]
+  \[
+    \Delta T = T_{\text{new}}-T\ \shp{N,1}.
+  \]
+  \item \textbf{Normalizar la salida.} $\Delta T_{\text{norm}}=(\Delta T-\mu_y)/\sigma_y$
+  \shp{N,1}, para cumplir el mismo contrato de salida que el modelo base.
+\end{enumerate}
+
+\io{latentes $\bm v$\,\shp{N,128}, \texttt{edge\_index}\,\shp{2,2E}, features crudas
+\texttt{x}\,\shp{N,12}.}
+{conductancias $\to$ Laplaciana (conserva energía) $+$ externo $\to$ inversión de la
+curva de entalpía.}
+{$\Delta T_{\text{norm}}$\,\shp{N,1} (incremento de temperatura, normalizado).}
+
+\begin{idea}[Dónde está lo aprendido y dónde la física]
+De todo el head, \textbf{lo único aprendido} son las conductancias $w_{ij}$ (un MLP
+pequeño sobre las latentes). El resto --- $\mu=1/T$, la suma Laplaciana, la tabla
+$H(T)$ y la inversión $h^{-1}$ --- es \textbf{física fija, sin parámetros}. Por eso
+la conservación de energía y el segundo principio se cumplen \emph{siempre}, no
+``si entrena bien''.
+\end{idea}
+
+\dummies{Entra un vector de 128 por nodo; sale \textbf{un} número por nodo: el
+$\Delta T$. Por el camino, la red solo decide ``cómo de bien conduce cada arista''
+($w_{ij}$); el resto es termodinámica de libro que garantiza que no se invente ni
+pierda energía.}
+
+%==============================================================================
+\section{Etapa 5 — De $\Delta T$ a la temperatura siguiente (rollout)}
+\label{sec:rollout}
+%==============================================================================
+
+La salida $\Delta T_{\text{norm}}$ se des-normaliza a kelvin y se suma:
+\[
+  T^{t+1} = T^{t} + \underbrace{\texttt{inverse\_y}(\Delta T_{\text{norm}})}_{\shp{N,}\ \text{en kelvin}}.
+\]
+En \textbf{inferencia} esto se encadena: el modelo arranca de $T^0$ y predice toda la
+película, \textbf{realimentando su propia predicción}. Clave: \emph{solo} se
+realimenta la columna de temperatura; las otras 11 features (fuente, coordenadas
+co-móviles, etc.) se conocen de antemano para todos los pasos (la trayectoria es
+determinista).
+
+\begin{center}
+\begin{tikzpicture}[node distance=5mm and 12mm]
+  \node[stage] (t0) {$T^{t}$\,\shp{N,}};
+  \node[stage, right=of t0] (mod) {MPNN + GENERIC};
+  \node[stage, right=of mod] (t1) {$T^{t+1}$\,\shp{N,}};
+  \draw[ar] (t0) -- node[slbl,above]{x con T} (mod);
+  \draw[ar] (mod) -- node[slbl,above]{$+\Delta T$} (t1);
+  \draw[ar, draw=nnblue!80] (t1) to[out=-90,in=-90,looseness=1.4]
+     node[below,font=\scriptsize,text=nnblue!80]{realimenta T} (t0);
+\end{tikzpicture}
+\end{center}
+
+\io{$T^0$\,\shp{N,} y la trayectoria conocida.}
+{repite $\sim$1500 veces: sobrescribe la columna T, pasa por la red, suma $\Delta T$.}
+{la película predicha $\widehat T$\,\shp{S,N}, comparable con la verdad FEM.}
+
+\dummies{Inferencia $=$ ``dame la primera foto y te doy toda la película''. Cada
+$\Delta T$ se suma y la nueva $T$ vuelve a entrar. Solo la temperatura se realimenta;
+todo lo demás (dónde está el arco, etc.) ya se sabe.}
+
+%==============================================================================
+\section{Etapa 6 — Cómo se construye la pérdida (push-forward $K$)}
+\label{sec:loss}
+%==============================================================================
+
+En \textbf{entrenamiento} no basta con un paso: entrenamos con \textbf{ventanas de
+$K$ pasos} (push-forward) para alinear el objetivo con el rollout largo. El
+\emph{dataloader} sirve, por cada ejemplo, una \textbf{ventana} de $K$ grafos
+consecutivos de la misma simulación: $[\,g_t,\ g_{t+1},\ \dots,\ g_{t+K-1}\,]$.
+
+El bucle de una ventana (con $K{=}2$):
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Sembrar:} $\hat T \gets T^{t}$ verdadero $+$ ruido \shp{N,}.
+  \item \textbf{Para cada paso $k=0,\dots,K{-}1$:}
+  \begin{enumerate}[leftmargin=1.3em,label=(\alph*)]
+    \item poner $\hat T$ en la columna de temperatura del grafo $g_{t+k}$;
+    \item normalizar, pasar por la red $\to$ $\Delta T$, des-normalizar \shp{N,};
+    \item predicción: $T_{\text{pred}} = \hat T + \Delta T$ \shp{N,};
+    \item verdad: $T_{\text{true}} = T^{t+k} + y_{t+k}$ \shp{N,} (la $T$ real del paso);
+    \item acumular pérdida:
+      $\displaystyle \mathcal L \mathrel{+}= \frac1N\sum_i\Big(\frac{T_{\text{pred},i}-T_{\text{true},i}}{\sigma_T}\Big)^2$;
+    \item \textbf{realimentar:} $\hat T \gets T_{\text{pred}}$ \ \emph{sin} \texttt{detach}.
+  \end{enumerate}
+  \item \textbf{Promediar:} $\mathcal L \gets \mathcal L / K$; \ \texttt{backward}, recortar gradiente, \texttt{optimizer.step}.
+\end{enumerate}
+
+\[
+  \boxed{\;\mathcal L \;=\; \frac1K\sum_{k=0}^{K-1}\ \frac1N\sum_{i=1}^{N}
+    \left(\frac{T^{(k)}_{\text{pred},i}-T^{(k)}_{\text{true},i}}{\sigma_T}\right)^{2}\;}
+\]
+(un MSE en temperatura física, escalado por la desviación $\sigma_T$).
+
+\io{una ventana de $K$ grafos consecutivos (en crudo, físicos).}
+{desenrolla $K$ pasos realimentando la predicción; mide el error contra la verdad de
+cada paso.}
+{un escalar $\mathcal L$ del que se hace \texttt{backward} a través de \emph{todos}
+los $K$ pasos (BPTT).}
+
+\begin{idea}[La línea que define el push-forward]
+El \texttt{$\hat T \gets T_{\text{pred}}$ sin \texttt{detach}} es lo que hace que el
+gradiente atraviese los $K$ pasos. Si pusieras \texttt{detach}, cada paso entrenaría
+aislado (objetivo de un paso) y no se alinearía con el rollout largo. $K{=}1$ es el
+caso clásico; $K{=}2$ ya fuerza al operador a ser contractivo en dos pasos.
+\end{idea}
+
+\dummies{Entrena ``jugando a predecir 2 pasos seguidos con tu propia predicción de
+por medio''. El error de los 2 pasos se suma y se propaga hacia atrás de una vez. Así
+la red aprende a no acumular errores, que es justo lo que falla en los rollouts
+largos.}
+
+%==============================================================================
+\section{Etapa 7 — Validación y selección del modelo}
+\label{sec:val}
+%==============================================================================
+
+La métrica que decide ``qué modelo guardamos'' \textbf{no} es la pérdida de un paso:
+es el \textbf{RMSE de un rollout autoregresivo completo} (§\ref{sec:rollout}) sobre
+las simulaciones de validación (que el modelo no vio en entrenamiento, por el
+\emph{split por simulación}). Se guarda el \emph{checkpoint} que minimiza ese RMSE.
+
+\io{el modelo actual + las sims de validación.}
+{rueda la película entera de cada sim y compara con la verdad FEM.}
+{un RMSE medio (kelvin). Si mejora, se guarda \texttt{best\_model.pt}.}
+
+\dummies{Validar $=$ ``despliega la película completa en datos nuevos y mira cuánto
+te desvías''. Es más exigente que mirar un solo paso, y es lo que de verdad nos
+importa para usar el modelo.}
+
+%==============================================================================
+\section{Resumen: qué entra y qué sale en cada etapa}
+\label{sec:resumen}
+%==============================================================================
+
+\renewcommand{\arraystretch}{1.25}
+\noindent\small
+\begin{tabular}{@{}p{0.18\linewidth}p{0.34\linewidth}p{0.40\linewidth}@{}}
+\toprule
+Etapa & Entra (forma) & Sale (forma) \\
+\midrule
+0. FEM            & parámetros & \texttt{temperature}\,\shp{S,N} (la verdad) \\
+1. Grafos         & 1 \texttt{SimulationResult} & $S{-}1$ grafos: \texttt{x}\,\shp{N,12}, \texttt{edge\_index}\,\shp{2,2E}, \texttt{edge\_attr}\,\shp{2E,3}, \texttt{y}\,\shp{N,1} \\
+2. Normalización  & \texttt{x}\,\shp{N,12} & \texttt{x\_norm}\,\shp{N,12} (misma forma) \\
+3. Encoder        & \shp{N,12} y \shp{2E,3} & $\bm v$\,\shp{N,128}, $\bm\epsilon$\,\shp{2E,128} \\
+3. Processor (×8) & $\bm v$\,\shp{N,128}, $\bm\epsilon$\,\shp{2E,128} & $\bm v$\,\shp{N,128} (contexto local) \\
+4. GENERIC head   & $\bm v$\,\shp{N,128}, \texttt{edge\_index}, \texttt{x}\,\shp{N,12} & $\Delta T_{\text{norm}}$\,\shp{N,1} \\
+5. Rollout        & $T^{t}$\,\shp{N,} & $T^{t+1}=T^{t}+\Delta T$\,\shp{N,} \\
+6. Pérdida ($K$)  & ventana de $K$ grafos & escalar $\mathcal L$ (BPTT por $K$ pasos) \\
+7. Validación     & modelo + sims val & RMSE de rollout (selección) \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+\begin{idea}[La regla mnemotécnica del flujo]
+\textbf{Filas $=$ ``por nodo'' ($N$) o ``por arista'' ($2E$); columnas $=$ ``cuánta
+información''.} El viaje es: $12 \to 128$ (el MPNN enriquece) $\to 1$ (el head
+GENERIC destila a un $\Delta T$ físico). Y ese $\Delta T$ se suma a $T$ y vuelve a
+entrar: una y otra vez en inferencia, $K$ veces con gradiente en entrenamiento.
+\end{idea}
+
+\end{document}
